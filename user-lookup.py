@@ -1,9 +1,18 @@
 import requests
 import telebot
+import time
 from datetime import datetime
 from config import BOT_TOKEN, OWNER_ID
 
 bot = telebot.TeleBot(BOT_TOKEN)
+
+start_time = time.time()
+stats = {
+    "total": 0,
+    "found": 0,
+    "not_found": 0,
+    "errors": 0,
+}
 
 
 def owner_only(func):
@@ -131,19 +140,50 @@ def handle_lookup(message):
     bot.reply_to(message, f"🔍 Looking up *{username}*...", parse_mode="Markdown")
 
     try:
+        stats["total"] += 1
         info = get_roblox_user_info(username)
         if info:
+            stats["found"] += 1
             bot.send_message(
                 message.chat.id, format_user_info(info), parse_mode="Markdown"
             )
         else:
+            stats["not_found"] += 1
             bot.send_message(
                 message.chat.id,
                 f"❌ User `{username}` not found.",
                 parse_mode="Markdown",
             )
     except Exception as e:
+        stats["errors"] += 1
         bot.send_message(message.chat.id, f"❌ Error: {e}")
+
+
+def format_elapsed(seconds):
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+@bot.message_handler(commands=["stats"])
+@owner_only
+def handle_stats(message):
+    elapsed = time.time() - start_time
+    text = (
+        f"⚡ *CHECKING STATS* ⚡\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 *Progress:*\n"
+        f"🔑 *Total:* {stats['total']}\n"
+        f"💎 *Found:* {stats['found']}\n"
+        f"❌ *Not Found:* {stats['not_found']}\n"
+        f"⚠️ *Errors:* {stats['errors']}\n"
+        f"📝 *Checked:* {stats['total']}/{stats['total']}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱️ *Uptime:* {format_elapsed(elapsed)}\n"
+        f"━━━━━━━━━━━━━━━━━━━"
+    )
+    bot.reply_to(message, text, parse_mode="Markdown")
 
 
 if __name__ == "__main__":
