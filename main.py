@@ -53,7 +53,6 @@ async def post_init(application: Application):
     await application.bot.set_my_commands([
         BotCommand("start", "Start the bot"),
         BotCommand("check", "Upload cookies file to check"),
-        BotCommand("lookup", "Lookup a Roblox user"),
         BotCommand("proxy", "Set custom proxies"),
         BotCommand("stats", "Show current session stats"),
         BotCommand("cancel", "Cancel current check"),

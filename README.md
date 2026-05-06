@@ -5,9 +5,10 @@ A fast, accurate, and feature-rich Telegram bot for Roblox cookie validation wit
 ## ✨ Features
 
 - **⚡ Super Fast Checking** - Async concurrent checking with configurable concurrency (up to 50+ simultaneous)
-- **💰 Robux Capture** - Captures Robux balance, premium status, credit, and pending Robux
-- **👤 Full User Lookup** - Profile info, friends, followers, groups, badges, collectibles
-- **📦 Multi-Format Support** - .txt, .zip, .json, .csv, .tsv, .log, .dat, .xml, .yaml and more
+- **💰 Robux Capture** - Automatically captures Robux balance, premium status, credit, and pending Robux on valid cookies
+- **👤 Full User Lookup** - Automatically runs full profile lookup (friends, followers, groups, badges, collectibles) on valid cookies
+- **📦 Multi-Format Support** - .txt, .zip, .rar, .7z, .json, .csv, .tsv, .log, .dat, .xml, .yaml and more
+- **📁 Per-File Breakdown** - When uploading archives, shows cookie count per file inside
 - **🔄 Proxy Rotation** - Smart proxy rotator with health checking and weighted selection
 - **💎 Value Tier System** - Automatic account valuation (BASIC → LEGENDARY)
 - **📊 Real-time Progress** - Live progress updates during checking
@@ -20,15 +21,18 @@ A fast, accurate, and feature-rich Telegram bot for Roblox cookie validation wit
 |---------|-------------|
 | `/start` | Show welcome menu with inline buttons |
 | `/check` | Upload a cookie file to validate |
-| `/lookup <username>` | Lookup a Roblox user profile |
 | `/proxy` | Upload custom proxy list |
 | `/stats` | Show current check session stats |
 | `/cancel` | Cancel a running check |
 
+> **Note:** User lookup + Robux capture runs **automatically** on every valid cookie found — no separate command needed! Just upload your file with `/check` and the bot does everything.
+
 ## 📁 Supported File Formats
 
 - `.txt` - Plain text (one cookie per line)
-- `.zip` - ZIP archives (parses all inner files)
+- `.zip` - ZIP archives (parses each inner file individually, supports nested archives)
+- `.rar` - RAR archives (parses each inner file individually)
+- `.7z` - 7-Zip archives (parses each inner file individually)
 - `.json` - JSON arrays or objects
 - `.jsonl` - JSON Lines format
 - `.csv` - Comma-separated values
@@ -38,6 +42,8 @@ A fast, accurate, and feature-rich Telegram bot for Roblox cookie validation wit
 - `.xml` - XML files
 - `.yaml`, `.yml` - YAML files
 - Any other text-based format
+
+> **Archive files (.zip, .rar, .7z):** Each file inside the archive is checked individually. You'll see a per-file breakdown showing how many cookies were found in each file. Nested archives (e.g., a .zip inside another .zip) are also supported.
 
 ## 🍪 Supported Cookie Formats
 

