@@ -170,17 +170,17 @@ def format_elapsed(seconds):
 @owner_only
 def handle_stats(message):
     elapsed = time.time() - start_time
+    checked = stats["found"] + stats["not_found"] + stats["errors"]
     text = (
-        f"⚡ *CHECKING STATS* ⚡\n"
+        f"⚡ *CHECKING* ⚡\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📊 *Progress:*\n"
         f"🔑 *Total:* {stats['total']}\n"
-        f"💎 *Found:* {stats['found']}\n"
-        f"❌ *Not Found:* {stats['not_found']}\n"
-        f"⚠️ *Errors:* {stats['errors']}\n"
-        f"📝 *Checked:* {stats['total']}/{stats['total']}\n"
+        f"💎 *Hits:* {stats['found']}\n"
+        f"❌ *Dead:* {stats['not_found']}\n"
+        f"📝 *Checked:* {checked}/{stats['total']}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"⏱️ *Uptime:* {format_elapsed(elapsed)}\n"
+        f"⏱️ *Time:* {format_elapsed(elapsed)}\n"
         f"━━━━━━━━━━━━━━━━━━━"
     )
     bot.reply_to(message, text, parse_mode="Markdown")
