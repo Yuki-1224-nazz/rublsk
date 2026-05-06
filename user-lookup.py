@@ -1,27 +1,26 @@
 import requests
-import time
+import telebot
 from datetime import datetime
-from rich.console import Console
-from rich.text import Text
 
-# Initialize console
-console = Console()
+BOT_TOKEN = "8483794654:AAGwgvv_DjfqkEp26-T_OKiN9HudkkIN-X8"
+OWNER_ID = 5028065177
 
-# Custom banner (your design)
-custom_banner = """
-888~-_            888       888           888   _   
-888   \\   e88~-_  888-~88e  888   /~~~8e  888 e~ ~  
-888    | d888   i 888  888b 888       88b 888d8b    
-888   /  8888   | 888  8888 888  e88~-888 888Y88b   
-888_-~   Y888   ' 888  888P 888 C888  888 888 Y88b  
-888 ~-_   "88_-~  888-_88"  888  "88_-888 888  Y88b 
-"""
+bot = telebot.TeleBot(BOT_TOKEN)
 
-# Print the banner and credits
-console.print(Text(custom_banner, style="cyan bold"))
-console.print(Text("         Adjusted by @KiritaniShinyaa", style="yellow bold"))
+
+def owner_only(func):
+    """Decorator to restrict commands to the owner."""
+    def wrapper(message):
+        if message.from_user.id != OWNER_ID:
+            bot.reply_to(message, "⛔ Access denied. Owner only.")
+            return
+        return func(message)
+    return wrapper
+
 
 def parse_date(date_str):
+    if not date_str:
+        return "Unknown Date"
     formats = ["%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"]
     for fmt in formats:
         try:
@@ -30,84 +29,125 @@ def parse_date(date_str):
             continue
     return "Unknown Date"
 
-def get_roblox_user_info(username, password):
-    try:
-        user_lookup_url = "https://users.roblox.com/v1/usernames/users"
-        response = requests.post(user_lookup_url, json={"usernames": [username]})
-        response.raise_for_status()
-        user_data = response.json().get("data", [])[0]
-        user_id = user_data["id"]
 
-        profile = requests.get(f"https://users.roblox.com/v1/users/{user_id}").json()
-        friends = requests.get(f"https://friends.roblox.com/v1/users/{user_id}/friends/count").json().get("count", 0)
-        followers = requests.get(f"https://friends.roblox.com/v1/users/{user_id}/followers/count").json().get("count", 0)
-        badges = requests.get(f"https://badges.roblox.com/v1/users/{user_id}/badges?limit=100").json().get("data", [])
-        groups = requests.get(f"https://groups.roblox.com/v1/users/{user_id}/groups/roles").json()
-        collectibles = requests.get(f"https://inventory.roblox.com/v1/users/{user_id}/assets/collectibles?limit=10").json().get("data", [])
-        avatar = f"https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds={user_id}&size=150x150&format=Png"
+def get_roblox_user_info(username):
+    user_lookup_url = "https://users.roblox.com/v1/usernames/users"
+    response = requests.post(user_lookup_url, json={"usernames": [username]})
+    response.raise_for_status()
 
-        return {
-            "USER": username,
-            "PASS": password,
-            "UserID": user_id,
-            "Username": profile.get("name"),
-            "DisplayName": profile.get("displayName"),
-            "ProfileURL": f"https://www.roblox.com/users/{user_id}/profile",
-            "Description": profile.get("description", "N/A"),
-            "IsBanned": profile.get("isBanned", False),
-            "AccountAgeDays": profile.get("age"),
-            "JoinDate": parse_date(profile.get("created")),
-            "BadgeCount": len(badges),
-            "CollectibleCount": len(collectibles),
-            "GroupCount": len(groups),
-            "FriendCount": friends,
-            "FollowerCount": followers,
-            "Avatar": avatar
-        }
-
-    except Exception as e:
-        console.print(f"× Error fetching {username}: {e}", style="red bold")
+    data = response.json().get("data", [])
+    if not data:
         return None
 
-file_name = input("Enter Roblak: ")
+    user_id = data[0]["id"]
 
-try:
-    with open(file_name, "r") as file:
-        lines = file.read().splitlines()
+    profile = requests.get(f"https://users.roblox.com/v1/users/{user_id}").json()
+    friends = requests.get(
+        f"https://friends.roblox.com/v1/users/{user_id}/friends/count"
+    ).json().get("count", 0)
+    followers = requests.get(
+        f"https://friends.roblox.com/v1/users/{user_id}/followers/count"
+    ).json().get("count", 0)
+    badges = requests.get(
+        f"https://badges.roblox.com/v1/users/{user_id}/badges?limit=100"
+    ).json().get("data", [])
+    groups = requests.get(
+        f"https://groups.roblox.com/v1/users/{user_id}/groups/roles"
+    ).json().get("data", [])
+    collectibles = requests.get(
+        f"https://inventory.roblox.com/v1/users/{user_id}/assets/collectibles?limit=10"
+    ).json().get("data", [])
 
-    accounts = []
+    avatar_resp = requests.get(
+        f"https://thumbnails.roblox.com/v1/users/avatar-headshot"
+        f"?userIds={user_id}&size=150x150&format=Png"
+    ).json()
+    avatar_url = "N/A"
+    avatar_data = avatar_resp.get("data", [])
+    if avatar_data:
+        avatar_url = avatar_data[0].get("imageUrl", "N/A")
 
-    console.print("\n🚀 Fetching data...\n", style="yellow bold")
-    for line in lines:
-        try:
-            username, password = line.split(":", 1)
-            username, password = username.strip(), password.strip()
-            if username and password:
-                accounts.append((username, password))
-            else:
-                console.print(f"× Skipping invalid entry: {line}", style="red bold")
-        except ValueError:
-            console.print(f"× Invalid format: {line}", style="red bold")
+    description = profile.get("description", "").strip() or "N/A"
 
-    output_file_name = "roblak_results.txt"
-    with open(output_file_name, "w") as output_file:
-        for index, (username, password) in enumerate(accounts, start=1):
-            console.print(f"🔍 Checking {index}/{len(accounts)}: {username}...", style="yellow bold")
-            info = get_roblox_user_info(username, password)
-            if info:
-                line_output = " | ".join([f"{key}: {val}" for key, val in info.items()])
-                output_file.write(line_output + "\n")
-                output_file.write("-" * 80 + "\n")  # Separator line
+    return {
+        "UserID": user_id,
+        "Username": profile.get("name"),
+        "DisplayName": profile.get("displayName"),
+        "ProfileURL": f"https://www.roblox.com/users/{user_id}/profile",
+        "Description": description,
+        "IsBanned": profile.get("isBanned", False),
+        "AccountAgeDays": profile.get("age"),
+        "JoinDate": parse_date(profile.get("created")),
+        "BadgeCount": len(badges),
+        "CollectibleCount": len(collectibles),
+        "GroupCount": len(groups),
+        "FriendCount": friends,
+        "FollowerCount": followers,
+        "AvatarURL": avatar_url,
+    }
 
-                console.print(line_output, style="green")
-                console.print("-" * 80, style="cyan")
-            else:
-                console.print(f"× Failed to fetch info for: {username}", style="red bold")
-            time.sleep(0.1)
 
-    console.print(f"\n✓ Done! Results saved in '{output_file_name}'.", style="green bold")
+def format_user_info(info):
+    banned_status = "Yes ⚠️" if info["IsBanned"] else "No"
+    return (
+        f"🔎 *Roblox User Info*\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 *Username:* `{info['Username']}`\n"
+        f"🏷 *Display Name:* `{info['DisplayName']}`\n"
+        f"🆔 *User ID:* `{info['UserID']}`\n"
+        f"🔗 *Profile:* [Link]({info['ProfileURL']})\n"
+        f"📝 *Description:* {info['Description']}\n"
+        f"🚫 *Banned:* {banned_status}\n"
+        f"📅 *Join Date:* {info['JoinDate']}\n"
+        f"📆 *Account Age:* {info['AccountAgeDays']} days\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🏅 *Badges:* {info['BadgeCount']}\n"
+        f"🎒 *Collectibles:* {info['CollectibleCount']}\n"
+        f"👥 *Groups:* {info['GroupCount']}\n"
+        f"🤝 *Friends:* {info['FriendCount']}\n"
+        f"👣 *Followers:* {info['FollowerCount']}\n"
+    )
 
-except FileNotFoundError:
-    console.print("× Error: File not found!", style="red bold")
-except Exception as e:
-    console.print(f"× Unexpected error: {e}", style="red bold")
+
+@bot.message_handler(commands=["start"])
+@owner_only
+def handle_start(message):
+    bot.reply_to(
+        message,
+        "👋 *Welcome to Roblox User Lookup Bot!*\n\n"
+        "Send /lookup `<username>` to search for a Roblox user.\n"
+        "Example: `/lookup Roblox`",
+        parse_mode="Markdown",
+    )
+
+
+@bot.message_handler(commands=["lookup"])
+@owner_only
+def handle_lookup(message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        bot.reply_to(message, "Usage: `/lookup <username>`", parse_mode="Markdown")
+        return
+
+    username = args[1].strip()
+    bot.reply_to(message, f"🔍 Looking up *{username}*...", parse_mode="Markdown")
+
+    try:
+        info = get_roblox_user_info(username)
+        if info:
+            bot.send_message(
+                message.chat.id, format_user_info(info), parse_mode="Markdown"
+            )
+        else:
+            bot.send_message(
+                message.chat.id,
+                f"❌ User `{username}` not found.",
+                parse_mode="Markdown",
+            )
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Error: {e}")
+
+
+if __name__ == "__main__":
+    print("Bot is running...")
+    bot.infinity_polling()
