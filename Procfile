@@ -1,1 +1,1 @@
-web: python user-lookup.py
+web: python bot.py

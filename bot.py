@@ -197,10 +197,24 @@ async def run_checker(chat_id, progress_msg, cookies):
 def handle_start(message):
     bot.reply_to(
         message,
-        "⚡️ *Roblox Cookie Checker Bot* ⚡️\n\n"
-        "🔥 /check - Check cookies from a text file\n"
-        "📊 /stats - View current stats\n"
-        "❓ /help - Help info",
+        "⚡️ *Welcome to Roblox Cookie Checker Bot!* ⚡️\n\n"
+        "Type /menu to see all commands.",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(commands=["menu"])
+@owner_only
+def handle_menu(message):
+    bot.reply_to(
+        message,
+        "⚡️ *ROBLOX COOKIE CHECKER* ⚡️\n"
+        "━━━━━━━━━━━━━━━━━\n\n"
+        "🔥 /check - Check cookies from a .txt file\n"
+        "📊 /stats - View current checker stats\n"
+        "❓ /help - How to use the bot\n"
+        "📋 /menu - Show this menu\n\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "🤖 Powered by NinjaTech",
         parse_mode="Markdown"
     )
 
