@@ -617,7 +617,7 @@ def handle_menu(message):
         f"━━━━━━━━━━━━━━━━━\n"
         f"🌐 Proxy: {proxy_status}\n"
         f"━━━━━━━━━━━━━━━━━\n"
-        f"🤖 Powered by NinjaTech",
+        f"🤖 Powered by Yuki",
         parse_mode="Markdown"
     )
 
