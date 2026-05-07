@@ -2,6 +2,7 @@ import asyncio
 import aiohttp
 import aiohttp_socks
 import telebot
+from telebot import types
 import time
 import threading
 import re
@@ -9,9 +10,54 @@ import os
 import zipfile
 import io
 import random
+import requests
 from config import BOT_TOKEN, OWNER_ID
 
 bot = telebot.TeleBot(BOT_TOKEN)
+
+# ─── Proxy Input Session ────────────────────────────────────────────
+# Tracks per-user proxy input mode so users can paste, upload files,
+# or send URLs one-by-one and then press "Done" to load them all.
+
+class ProxyInputSession:
+    """Holds accumulated proxy lines while a user is in proxy-input mode."""
+
+    def __init__(self, chat_id, msg_id):
+        self.chat_id = chat_id
+        self.msg_id = msg_id          # the status message we keep editing
+        self.lines: list[str] = []    # accumulated raw proxy lines
+        self.sources: list[str] = []  # description of each source
+
+    def add_lines(self, raw_text: str, source_desc: str):
+        added = 0
+        for line in raw_text.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                self.lines.append(line)
+                added += 1
+        if added:
+            self.sources.append(f"{source_desc} ({added} lines)")
+        return added
+
+    @property
+    def total(self):
+        return len(self.lines)
+
+    def status_text(self):
+        src_list = "\n".join(f"  • {s}" for s in self.sources) if self.sources else "  None yet"
+        return (
+            f"🌐 *Proxy Input Mode*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Collected: *{self.total}* proxy lines\n"
+            f"📥 Sources:\n"
+            f"{src_list}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Send more proxies, files, or URLs.\n"
+            f"Press *Done ✅* to load them all."
+        )
+
+# chat_id -> ProxyInputSession
+proxy_sessions: dict[int, ProxyInputSession] = {}
 
 # ─── Proxy Rotator ────────────────────────────────────────────────────
 class ProxyRotator:
@@ -609,7 +655,7 @@ def handle_menu(message):
         f"⚡️ *ROBLOX COOKIE CHECKER* ⚡️\n"
         f"━━━━━━━━━━━━━━━━━\n\n"
         f"🔥 /check - Check cookies from .zip or .txt\n"
-        f"🌐 /proxy - Load proxy list (file or GitHub URL)\n"
+        f"🌐 /proxy - Load proxies (interactive: paste, file, or URL)\n"
         f"📊 /stats - View current checker stats\n"
         f"🗑️ /proxyclear - Clear all proxies\n"
         f"❓ /help - How to use the bot\n"
@@ -632,87 +678,254 @@ def handle_help(message):
         "2️⃣ .zip = cookie files from stealer logs\n"
         "3️⃣ .txt = plain cookies (one per line) or Netscape format\n"
         "4️⃣ Live progress shown during checking\n\n"
-        "🌐 *Proxy Setup:*\n"
-        "1️⃣ /proxy with a .txt file attached (one proxy per line)\n"
-        "2️⃣ /proxy with a GitHub raw URL as caption\n"
-        "3️⃣ Supports: ip:port, ip:port:user:pass, user:pass@ip:port\n"
-        "4️⃣ Supports: http://, https://, socks4://, socks5://\n"
-        "5️⃣ Auto-rotates proxies and removes dead ones\n\n"
-        "💡 Tip: Use proxies to avoid rate limits!",
+        "🌐 *Proxy Setup (Interactive):*\n"
+        "1️⃣ /proxy → enters proxy input mode\n"
+        "2️⃣ Paste proxy lines directly in chat\n"
+        "3️⃣ Upload .txt files with proxies\n"
+        "4️⃣ Send GitHub raw / pastebin URLs\n"
+        "5️⃣ Mix all methods, send multiple times\n"
+        "6️⃣ Press Done ✅ to load, Cancel ❌ to abort\n\n"
+        "📋 *Supported proxy formats:*\n"
+        "• ip:port\n"
+        "• ip:port:user:pass\n"
+        "• user:pass@ip:port\n"
+        "• http://, https://, socks4://, socks5://\n\n"
+        "💡 Auto-rotates proxies and removes dead ones!",
         parse_mode="Markdown"
     )
 
 @bot.message_handler(commands=["proxy"])
 @owner_only
 def handle_proxy(message):
-    args = message.text.split(maxsplit=1)
+    """Enter interactive proxy-input mode.
 
-    # Option 1: GitHub raw URL in command
-    if len(args) >= 2 and ("github" in args[1].lower() or "raw.githubusercontent" in args[1].lower()):
-        url = args[1].strip()
-        bot.reply_to(message, f"📥 Downloading proxy list from URL...")
+    The user can then:
+    • Paste proxy lines directly as text messages
+    • Upload .txt files containing proxies
+    • Send GitHub / raw.githubusercontent.com URLs
+    • Mix any of the above, multiple times
+
+    When finished, press the Done ✅ button to load everything.
+    Press Cancel ❌ to abort without loading.
+    """
+    chat_id = message.chat.id
+
+    # If already in a proxy session, just update the status
+    if chat_id in proxy_sessions:
+        sess = proxy_sessions[chat_id]
         try:
-            import requests
-            resp = requests.get(url, timeout=15)
-            if resp.status_code == 200:
-                proxy_rotator.load_from_text(resp.text)
-                total_p, alive_p = proxy_rotator.count()
-                bot.reply_to(
-                    message,
-                    f"✅ *Proxies Loaded from URL!*\n"
-                    f"━━━━━━━━━━━━━━━━━\n"
-                    f"📝 Total: {total_p}\n"
-                    f"✅ Valid: {alive_p}\n"
-                    f"🌐 Proxy rotation enabled!",
-                    parse_mode="Markdown"
-                )
-            else:
-                bot.reply_to(message, f"❌ Failed to download: HTTP {resp.status_code}")
-        except Exception as e:
-            bot.reply_to(message, f"❌ Error downloading: {e}")
+            bot.edit_message_text(
+                sess.status_text(),
+                chat_id,
+                sess.msg_id,
+                parse_mode="Markdown",
+                reply_markup=_proxy_mode_keyboard()
+            )
+        except Exception:
+            pass
+        bot.reply_to(message, "⚠️ You're already in proxy input mode. Keep sending proxies or press Done ✅.")
         return
 
-    # Option 2: File attached
-    if not message.document:
-        bot.reply_to(
-            message,
-            "❌ Please attach a .txt file with proxies OR provide a GitHub raw URL.\n\n"
-            "Usage:\n"
-            "• `/proxy` with .txt file attached\n"
-            "• `/proxy https://raw.githubusercontent.com/.../proxies.txt`\n\n"
-            "Supported formats:\n"
-            "• `ip:port`\n"
-            "• `ip:port:user:pass`\n"
-            "• `user:pass@ip:port`\n"
-            "• `http://ip:port`\n"
-            "• `http://user:pass@ip:port`\n"
-            "• `https://ip:port`\n"
-            "• `socks4://ip:port`\n"
-            "• `socks5://user:pass@ip:port`",
-            parse_mode="Markdown"
+    # Create a new session
+    markup = _proxy_mode_keyboard()
+    status_msg = bot.reply_to(
+        message,
+        "🌐 *Proxy Input Mode*\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "📊 Collected: *0* proxy lines\n"
+        "📥 Sources:\n"
+        "  None yet\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "Send proxies by:\n"
+        "• Pasting proxy lines directly\n"
+        "• Uploading a .txt file\n"
+        "• Sending a GitHub raw URL\n\n"
+        "Press *Done ✅* when finished.",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+    proxy_sessions[chat_id] = ProxyInputSession(chat_id, status_msg.message_id)
+
+
+def _proxy_mode_keyboard():
+    """Inline keyboard for proxy input mode."""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("✅ Done", callback_data="proxy_done"),
+        types.InlineKeyboardButton("❌ Cancel", callback_data="proxy_cancel"),
+    )
+    return markup
+
+
+def _update_session_status(sess):
+    """Edit the status message to reflect the current session state."""
+    try:
+        bot.edit_message_text(
+            sess.status_text(),
+            sess.chat_id,
+            sess.msg_id,
+            parse_mode="Markdown",
+            reply_markup=_proxy_mode_keyboard()
         )
+    except Exception:
+        pass
+
+
+def _is_github_raw_url(text):
+    """Check if text looks like a GitHub raw / paste URL."""
+    lower = text.lower().strip()
+    return any(domain in lower for domain in [
+        "github.com", "raw.githubusercontent.com", "pastebin.com",
+        "paste.ee", "rentry.co", "hastebin.com"
+    ])
+
+
+def _fetch_url_text(url):
+    """Download text content from a URL. Returns None on failure."""
+    try:
+        resp = requests.get(url, timeout=15)
+        if resp.status_code == 200:
+            return resp.text
+    except Exception:
+        pass
+    return None
+
+
+def _process_proxy_input(message):
+    """Handle a regular text / document message while in proxy-input mode."""
+    chat_id = message.chat.id
+    if chat_id not in proxy_sessions:
+        return False  # not in proxy mode
+
+    sess = proxy_sessions[chat_id]
+
+    # ── 1) Document (.txt file) attached ────────────────────────────
+    if message.document:
+        file_info = bot.get_file(message.document.file_id)
+        downloaded = bot.download_file(file_info.file_path)
+        content = downloaded.decode("utf-8", errors="ignore")
+        fname = message.document.file_name or "file.txt"
+        added = sess.add_lines(content, f"📄 {fname}")
+        if added:
+            bot.reply_to(message, f"✅ Added *{added}* proxies from `{fname}`", parse_mode="Markdown")
+        else:
+            bot.reply_to(message, "⚠️ No valid proxy lines found in that file.")
+        _update_session_status(sess)
+        return True
+
+    # ── 2) Text message ─────────────────────────────────────────────
+    text = message.text
+    if not text:
+        return True
+
+    text = text.strip()
+
+    # Check if it's a URL (GitHub raw, pastebin, etc.)
+    if _is_github_raw_url(text):
+        # Extract URL — might be the whole message or embedded
+        url_match = re.search(r'(https?://[^\s]+)', text)
+        if url_match:
+            url = url_match.group(1)
+            bot.reply_to(message, "📥 Downloading proxy list...")
+            content = _fetch_url_text(url)
+            if content:
+                added = sess.add_lines(content, "🔗 URL")
+                if added:
+                    bot.reply_to(message, f"✅ Added *{added}* proxies from URL", parse_mode="Markdown")
+                else:
+                    bot.reply_to(message, "⚠️ Downloaded but no valid proxy lines found.")
+            else:
+                bot.reply_to(message, "❌ Failed to download from that URL.")
+            _update_session_status(sess)
+            return True
+
+    # Plain pasted proxy lines
+    added = sess.add_lines(text, "✏️ Pasted")
+    if added:
+        bot.reply_to(message, f"✅ Added *{added}* proxy lines", parse_mode="Markdown")
+    else:
+        bot.reply_to(message, "⚠️ No valid proxy lines detected in that message.")
+    _update_session_status(sess)
+    return True
+
+
+# ── Catch-all handler for messages while in proxy mode ───────────────
+# We register this with higher priority so it fires BEFORE other message
+# handlers when the user is in proxy-input mode.
+
+@bot.message_handler(func=lambda m: m.chat.id in proxy_sessions, content_types=["text", "document"])
+def proxy_mode_catchall(message):
+    """Intercept text/document messages while the user is in proxy-input mode."""
+    _process_proxy_input(message)
+
+
+# ── Callback handlers for Done / Cancel buttons ─────────────────────
+
+@bot.callback_query_handler(func=lambda call: call.data == "proxy_done")
+def callback_proxy_done(call):
+    chat_id = call.message.chat.id
+    if chat_id not in proxy_sessions:
+        bot.answer_callback_query(call.id, "⚠️ No active proxy session.", show_alert=True)
         return
 
-    file_info = bot.get_file(message.document.file_id)
-    downloaded = bot.download_file(file_info.file_path)
-    content = downloaded.decode('utf-8', errors='ignore')
+    sess = proxy_sessions.pop(chat_id)
+    all_text = "\n".join(sess.lines)
 
-    proxy_rotator.load_from_text(content)
+    if not all_text.strip():
+        bot.edit_message_text(
+            "❌ No proxies were collected. Session cancelled.",
+            chat_id,
+            sess.msg_id
+        )
+        bot.answer_callback_query(call.id, "No proxies collected.")
+        return
+
+    # Load everything into the proxy rotator
+    proxy_rotator.load_from_text(all_text)
     total_p, alive_p = proxy_rotator.count()
 
     if total_p == 0:
-        bot.reply_to(message, "❌ No valid proxies found in the file.")
+        bot.edit_message_text(
+            "❌ No valid proxies found in the collected data.",
+            chat_id,
+            sess.msg_id
+        )
+        bot.answer_callback_query(call.id, "No valid proxies.")
         return
 
-    bot.reply_to(
-        message,
+    src_list = "\n".join(f"  • {s}" for s in sess.sources)
+    bot.edit_message_text(
         f"✅ *Proxies Loaded!*\n"
-        f"━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"📝 Total: {total_p}\n"
         f"✅ Valid: {alive_p}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📥 Sources:\n"
+        f"{src_list}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"🌐 Proxy rotation enabled!",
+        chat_id,
+        sess.msg_id,
         parse_mode="Markdown"
     )
+    bot.answer_callback_query(call.id, f"✅ {alive_p}/{total_p} proxies loaded!")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "proxy_cancel")
+def callback_proxy_cancel(call):
+    chat_id = call.message.chat.id
+    if chat_id not in proxy_sessions:
+        bot.answer_callback_query(call.id, "⚠️ No active proxy session.", show_alert=True)
+        return
+
+    proxy_sessions.pop(chat_id)
+    bot.edit_message_text(
+        "❌ Proxy input cancelled. No proxies were loaded.",
+        chat_id,
+        call.message.message_id
+    )
+    bot.answer_callback_query(call.id, "Cancelled.")
 
 @bot.message_handler(commands=["proxyclear"])
 @owner_only
