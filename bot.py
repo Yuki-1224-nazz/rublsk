@@ -25,8 +25,11 @@ class ProxyInputSession:
     def __init__(self, chat_id, msg_id):
         self.chat_id = chat_id
         self.msg_id = msg_id          # the status message we keep editing
-        self.lines: list[str] = []    # accumulated raw proxy lines
-        self.sources: list[str] = []  # description of each source
+        self.btn_msg_id = None        # the Done/Cancel button message (always latest)
+        self.lines: list = []         # accumulated raw proxy lines
+        self.sources: list = []       # description of each source
+        self.user_msgs: list = []     # message_ids from user (to delete on Done)
+        self.bot_replies: list = []   # message_ids from bot replies (to delete on Done)
 
     def add_lines(self, raw_text: str, source_desc: str):
         added = 0
@@ -52,8 +55,7 @@ class ProxyInputSession:
             f"📥 Sources:\n"
             f"{src_list}\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Send more proxies, files, or URLs.\n"
-            f"Press *Done ✅* to load them all."
+            f"Send more proxies, files, or URLs."
         )
 
 # chat_id -> ProxyInputSession
@@ -726,8 +728,7 @@ def handle_proxy(message):
         bot.reply_to(message, "⚠️ You're already in proxy input mode. Keep sending proxies or press Done ✅.")
         return
 
-    # Create a new session
-    markup = _proxy_mode_keyboard()
+    # Create a new session — status message first (no buttons)
     status_msg = bot.reply_to(
         message,
         "🌐 *Proxy Input Mode*\n"
@@ -739,13 +740,20 @@ def handle_proxy(message):
         "Send proxies by:\n"
         "• Pasting proxy lines directly\n"
         "• Uploading a .txt file\n"
-        "• Sending a GitHub raw URL\n\n"
-        "Press *Done ✅* when finished.",
-        parse_mode="Markdown",
-        reply_markup=markup
+        "• Sending a GitHub raw URL",
+        parse_mode="Markdown"
     )
 
-    proxy_sessions[chat_id] = ProxyInputSession(chat_id, status_msg.message_id)
+    # Send Done/Cancel buttons as a separate message (always at bottom)
+    btn_msg = bot.send_message(
+        chat_id,
+        "👇 Click when finished:",
+        reply_markup=_proxy_mode_keyboard()
+    )
+
+    sess = ProxyInputSession(chat_id, status_msg.message_id)
+    sess.btn_msg_id = btn_msg.message_id
+    proxy_sessions[chat_id] = sess
 
 
 def _proxy_mode_keyboard():
@@ -759,15 +767,33 @@ def _proxy_mode_keyboard():
 
 
 def _update_session_status(sess):
-    """Edit the status message to reflect the current session state."""
+    """Edit the status message and repost the Done/Cancel buttons at the bottom."""
+    # Edit the status message (no inline keyboard on this one)
     try:
         bot.edit_message_text(
             sess.status_text(),
             sess.chat_id,
             sess.msg_id,
-            parse_mode="Markdown",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    # Delete old button message if it exists
+    if sess.btn_msg_id:
+        try:
+            bot.delete_message(sess.chat_id, sess.btn_msg_id)
+        except Exception:
+            pass
+
+    # Send a fresh button message so it's always at the bottom of the chat
+    try:
+        btn_msg = bot.send_message(
+            sess.chat_id,
+            "👇 Click when finished:",
             reply_markup=_proxy_mode_keyboard()
         )
+        sess.btn_msg_id = btn_msg.message_id
     except Exception:
         pass
 
@@ -800,17 +826,22 @@ def _process_proxy_input(message):
 
     sess = proxy_sessions[chat_id]
 
+    # Track the user's original message for cleanup
+    sess.user_msgs.append(message.message_id)
+
     # ── 1) Document (.txt file) attached ────────────────────────────
     if message.document:
         file_info = bot.get_file(message.document.file_id)
         downloaded = bot.download_file(file_info.file_path)
-        content = downloaded.decode("utf-8", errors="ignore")
+        file_content = downloaded.decode("utf-8", errors="ignore")
         fname = message.document.file_name or "file.txt"
-        added = sess.add_lines(content, f"📄 {fname}")
+        added = sess.add_lines(file_content, f"📄 {fname}")
         if added:
-            bot.reply_to(message, f"✅ Added *{added}* proxies from `{fname}`", parse_mode="Markdown")
+            r = bot.reply_to(message, f"✅ Added *{added}* proxies from `{fname}`", parse_mode="Markdown")
+            sess.bot_replies.append(r.message_id)
         else:
-            bot.reply_to(message, "⚠️ No valid proxy lines found in that file.")
+            r = bot.reply_to(message, "⚠️ No valid proxy lines found in that file.")
+            sess.bot_replies.append(r.message_id)
         _update_session_status(sess)
         return True
 
@@ -827,25 +858,31 @@ def _process_proxy_input(message):
         url_match = re.search(r'(https?://[^\s]+)', text)
         if url_match:
             url = url_match.group(1)
-            bot.reply_to(message, "📥 Downloading proxy list...")
-            content = _fetch_url_text(url)
-            if content:
-                added = sess.add_lines(content, "🔗 URL")
+            r = bot.reply_to(message, "📥 Downloading proxy list...")
+            sess.bot_replies.append(r.message_id)
+            url_content = _fetch_url_text(url)
+            if url_content:
+                added = sess.add_lines(url_content, "🔗 URL")
                 if added:
-                    bot.reply_to(message, f"✅ Added *{added}* proxies from URL", parse_mode="Markdown")
+                    r2 = bot.reply_to(message, f"✅ Added *{added}* proxies from URL", parse_mode="Markdown")
+                    sess.bot_replies.append(r2.message_id)
                 else:
-                    bot.reply_to(message, "⚠️ Downloaded but no valid proxy lines found.")
+                    r2 = bot.reply_to(message, "⚠️ Downloaded but no valid proxy lines found.")
+                    sess.bot_replies.append(r2.message_id)
             else:
-                bot.reply_to(message, "❌ Failed to download from that URL.")
+                r2 = bot.reply_to(message, "❌ Failed to download from that URL.")
+                sess.bot_replies.append(r2.message_id)
             _update_session_status(sess)
             return True
 
     # Plain pasted proxy lines
     added = sess.add_lines(text, "✏️ Pasted")
     if added:
-        bot.reply_to(message, f"✅ Added *{added}* proxy lines", parse_mode="Markdown")
+        r = bot.reply_to(message, f"✅ Added *{added}* proxy lines", parse_mode="Markdown")
+        sess.bot_replies.append(r.message_id)
     else:
-        bot.reply_to(message, "⚠️ No valid proxy lines detected in that message.")
+        r = bot.reply_to(message, "⚠️ No valid proxy lines detected in that message.")
+        sess.bot_replies.append(r.message_id)
     _update_session_status(sess)
     return True
 
@@ -872,12 +909,30 @@ def callback_proxy_done(call):
     sess = proxy_sessions.pop(chat_id)
     all_text = "\n".join(sess.lines)
 
+    # ── Cleanup: delete all user proxy messages and bot replies ──────
+    for mid in sess.user_msgs:
+        try:
+            bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+    for mid in sess.bot_replies:
+        try:
+            bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+
+    # Delete the button message and status message
+    if sess.btn_msg_id:
+        try:
+            bot.delete_message(chat_id, sess.btn_msg_id)
+        except Exception:
+            pass
+
     if not all_text.strip():
-        bot.edit_message_text(
-            "❌ No proxies were collected. Session cancelled.",
-            chat_id,
-            sess.msg_id
-        )
+        try:
+            bot.delete_message(chat_id, sess.msg_id)
+        except Exception:
+            pass
         bot.answer_callback_query(call.id, "No proxies collected.")
         return
 
@@ -919,12 +974,31 @@ def callback_proxy_cancel(call):
         bot.answer_callback_query(call.id, "⚠️ No active proxy session.", show_alert=True)
         return
 
-    proxy_sessions.pop(chat_id)
-    bot.edit_message_text(
-        "❌ Proxy input cancelled. No proxies were loaded.",
-        chat_id,
-        call.message.message_id
-    )
+    sess = proxy_sessions.pop(chat_id)
+
+    # Cleanup: delete all user proxy messages and bot replies
+    for mid in sess.user_msgs:
+        try:
+            bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+    for mid in sess.bot_replies:
+        try:
+            bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+
+    # Delete status message and button message too
+    if sess.btn_msg_id:
+        try:
+            bot.delete_message(chat_id, sess.btn_msg_id)
+        except Exception:
+            pass
+    try:
+        bot.delete_message(chat_id, sess.msg_id)
+    except Exception:
+        pass
+
     bot.answer_callback_query(call.id, "Cancelled.")
 
 @bot.message_handler(commands=["proxyclear"])
