@@ -71,42 +71,53 @@ class CheckInputSession:
         self.chat_id = chat_id
         self.msg_id = msg_id          # the status message we keep editing
         self.btn_msg_id = None        # the Start/Cancel button message
-        self.cookie_entries: list = []  # accumulated cookie entries
+        self.cookie_entries: list = []  # accumulated cookie entries (with .ROBLOSECURITY)
+        self.no_cookie_count: int = 0   # files without .ROBLOSECURITY
         self.filenames: list = []       # track which files were loaded
         self.user_msgs: list = []       # user message ids (to delete on start)
         self.bot_replies: list = []     # bot reply message ids (to delete on start)
 
-    def add_entries(self, entries, filename):
+    def add_entries(self, entries, no_cookie, filename):
         self.cookie_entries.extend(entries)
+        self.no_cookie_count += no_cookie
         self.filenames.append(filename)
 
     @property
     def total(self):
         return len(self.cookie_entries)
 
+    @property
+    def total_files(self):
+        return len(self.cookie_entries) + self.no_cookie_count
+
     def status_text(self):
         if not self.filenames:
             return (
-                f"🔍 *Check Mode*\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📊 Cookies: *0*\n"
-                f"📥 Files: None yet\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"\U0001f50d *Check Mode*\n"
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                f"\U0001f4ca Total Files: *0*\n"
+                f"\U0001f511 Valid Cookies: *0*\n"
+                f"\U0001f6ab No Cookie: *0*\n"
+                f"\U0001f4e5 Files: None yet\n"
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                 f"Send a .zip or .txt file with cookies."
             )
-        file_list = "\n".join(f"  • `{f}`" for f in self.filenames)
+        file_list = "\n".join(f"  \u2022 `{f}`" for f in self.filenames)
+        no_cookie_info = f"\n\U0001f6ab No Cookie: *{self.no_cookie_count}*" if self.no_cookie_count else ""
         proxy_info = ""
         if proxy_rotator.enabled:
             total_p, alive_p = proxy_rotator.count()
-            proxy_info = f"\n🌐 Proxy: {alive_p}/{total_p}"
+            proxy_info = f"\n\U0001f310 Proxy: {alive_p}/{total_p}"
         return (
-            f"🔍 *Check Mode*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 Cookies: *{self.total}*\n"
-            f"📥 Files:\n"
-            f"{file_list}{proxy_info}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Send more files or press *Start ✅* to begin checking."
+            f"\U0001f50d *Check Mode*\n"
+            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"\U0001f4ca Total Files: *{self.total_files}*\n"
+            f"\U0001f511 Valid Cookies: *{self.total}*\n"
+            f"{no_cookie_info}{proxy_info}\n"
+            f"\U0001f4e5 Files:\n"
+            f"{file_list}\n"
+            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"Send more files or press *Start \u2705* to begin checking."
         )
 
 # chat_id -> CheckInputSession
@@ -385,14 +396,19 @@ def fast_extract_roblosecurity(content):
     return extract_roblosecurity(content)
 
 def process_upload(file_content, filename):
-    """Process an uploaded file and return list of (roblosecurity, country, ip, browser, filename).
+    """Process an uploaded file and return (cookie_entries, no_cookie_count).
     
     Supports:
     - .zip containing cookie .txt files (fast parallel extraction)
     - .txt with one cookie per line (plain format)
     - .txt in Netscape cookie format
+    
+    Returns:
+    - cookie_entries: list of tuples (roblosecurity, country, ip, browser, filename)
+    - no_cookie_count: number of files that had no .ROBLOSECURITY cookie
     """
     cookie_entries = []
+    no_cookie_count = 0
     
     if filename.endswith('.zip'):
         try:
@@ -404,32 +420,38 @@ def process_upload(file_content, filename):
                 # Read all files at once for speed
                 for name in txt_files:
                     try:
-                        content = zf.read(name).decode('utf-8', errors='ignore')
+                        file_content_text = zf.read(name).decode('utf-8', errors='ignore')
                         basename = os.path.basename(name)
                         country, ip, browser = parse_filename(basename)
-                        roblosecurity = fast_extract_roblosecurity(content)
+                        roblosecurity = fast_extract_roblosecurity(file_content_text)
                         if roblosecurity:
                             cookie_entries.append((roblosecurity, country, ip, browser, basename))
                         else:
-                            # Track no-cookie files in stats later
-                            pass
+                            no_cookie_count += 1
                     except Exception:
-                        continue
+                        no_cookie_count += 1
         except zipfile.BadZipFile:
             pass
     else:
-        content = file_content.decode('utf-8', errors='ignore')
-        roblosecurity = fast_extract_roblosecurity(content)
+        file_text = file_content.decode('utf-8', errors='ignore')
+        roblosecurity = fast_extract_roblosecurity(file_text)
         if roblosecurity:
             country, ip, browser = parse_filename(filename)
             cookie_entries.append((roblosecurity, country, ip, browser, filename))
         else:
-            for line in content.splitlines():
+            plain_lines = []
+            for line in file_text.splitlines():
                 line = line.strip()
                 if line and not line.startswith("#"):
+                    plain_lines.append(line)
+            if plain_lines:
+                for line in plain_lines:
                     cookie_entries.append((line, "??", "?.?.?.?", "Direct", "manual"))
+            else:
+                no_cookie_count += 1
     
-    return cookie_entries
+    return cookie_entries, no_cookie_count
+
 
 # ─── Progress message builder ─────────────────────────────────────────
 def build_progress_text():
@@ -539,9 +561,6 @@ async def validate_cookie(session, roblosecurity, use_proxy=True):
 
 async def run_checker(chat_id, progress_msg, cookie_entries):
     """Run the checker with concurrency, proxy rotation, and live progress updates."""
-    stats.reset()
-    stats.total = len(cookie_entries)
-    stats.start_time = time.time()
 
     # Create connector based on proxy type
     connector_kwargs = {"limit": CONCURRENCY, "limit_per_host": 0}  # no per-host limit with proxies
@@ -1160,13 +1179,28 @@ def _process_check_input(message):
     downloaded = bot.download_file(file_info.file_path)
     filename = message.document.file_name or "unknown.txt"
 
-    cookie_entries = process_upload(downloaded, filename)
+    cookie_entries, no_cookie_count = process_upload(downloaded, filename)
 
-    if not cookie_entries:
-        r = bot.reply_to(message, f"❌ No .ROBLOSECURITY cookies found in `{filename}`.")
+    total_files = len(cookie_entries) + no_cookie_count
+
+    if total_files == 0:
+        r = bot.reply_to(message, f"\u274c No cookie files found in `{filename}`.")
         sess.bot_replies.append(r.message_id)
         _update_check_session_status(sess)
         return True
+
+    sess.add_entries(cookie_entries, no_cookie_count, filename)
+    
+    status_parts = []
+    if cookie_entries:
+        status_parts.append(f"\u2705 *{len(cookie_entries)}* valid cookies")
+    if no_cookie_count:
+        status_parts.append(f"\U0001f6ab *{no_cookie_count}* no cookie")
+    status_msg = " | ".join(status_parts)
+    r = bot.reply_to(message, f"{status_msg} from `{filename}`", parse_mode="Markdown")
+    sess.bot_replies.append(r.message_id)
+    _update_check_session_status(sess)
+    return True
 
     sess.add_entries(cookie_entries, filename)
     r = bot.reply_to(message, f"✅ Added *{len(cookie_entries)}* cookies from `{filename}`", parse_mode="Markdown")
@@ -1237,20 +1271,73 @@ def callback_check_start(call):
 
     # ── Start the checker ────────────────────────────────────────────
     cookie_entries = sess.cookie_entries
+    no_cookie_count = sess.no_cookie_count
+    total_files = len(cookie_entries) + no_cookie_count
+
+    # If no valid cookies AND no files at all, cleanup and inform
+    if total_files == 0:
+        # No cookies loaded - cleanup and inform
+        for mid in sess.user_msgs:
+            try:
+                bot.delete_message(chat_id, mid)
+            except Exception:
+                pass
+        for mid in sess.bot_replies:
+            try:
+                bot.delete_message(chat_id, mid)
+            except Exception:
+                pass
+        if sess.btn_msg_id:
+            try:
+                bot.delete_message(chat_id, sess.btn_msg_id)
+            except Exception:
+                pass
+        try:
+            bot.delete_message(chat_id, sess.msg_id)
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id, "No cookies loaded.")
+        return
+
+    # Cleanup: delete all user messages and bot replies
+    for mid in sess.user_msgs:
+        try:
+            bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+    for mid in sess.bot_replies:
+        try:
+            bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+    if sess.btn_msg_id:
+        try:
+            bot.delete_message(chat_id, sess.btn_msg_id)
+        except Exception:
+            pass
+
+    # Start the checker
     stats.reset()
-    stats.total = len(cookie_entries)
     stats.start_time = time.time()
+    stats.total = total_files
+    stats.no_cookie = no_cookie_count
+    stats.checked = no_cookie_count  # no-cookie files are already "checked"
 
     proxy_info = ""
     if proxy_rotator.enabled:
         total_p, alive_p = proxy_rotator.count()
-        proxy_info = f"\n🌐 Proxy: {alive_p}/{total_p}"
+        proxy_info = f"\n\U0001f310 Proxy: {alive_p}/{total_p}"
 
     file_list = ", ".join(f"`{f}`" for f in sess.filenames)
+    
+    cookie_info = f"\U0001f511 Valid Cookies: {len(cookie_entries)}"
+    if no_cookie_count:
+        cookie_info += f" | \U0001f6ab No Cookie: {no_cookie_count}"
+    
     bot.edit_message_text(
-        f"📂 *Files:* {file_list}\n"
-        f"🔑 *Cookies found:* {len(cookie_entries)}{proxy_info}\n"
-        f"🚀 Starting check...",
+        f"\U0001f4c2 *Files:* {file_list}\n"
+        f"{cookie_info}{proxy_info}\n"
+        f"\U0001f680 Starting check...",
         chat_id,
         sess.msg_id,
         parse_mode="Markdown"
@@ -1268,7 +1355,7 @@ def callback_check_start(call):
     thread = threading.Thread(target=run_in_thread, daemon=True)
     thread.start()
 
-    bot.answer_callback_query(call.id, f"🚀 Checking {len(cookie_entries)} cookies!")
+    bot.answer_callback_query(call.id, f"\U0001f680 Checking {len(cookie_entries)} cookies ({total_files} total files)!")
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "check_cancel")
